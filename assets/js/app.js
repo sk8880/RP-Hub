@@ -2,7 +2,8 @@ const { createApp, ref, reactive, computed, onMounted, onBeforeUnmount, watch, n
 const { useStorageManagement, useTokenUsage } = window.RPHubComposables;
 const { createMessageRenderer } = window.RPHubMessageRenderer;
 const { AppSidebar } = window.RPHubLayoutComponents;
-const { requestChatCompletion } = window.RPHubApiClient;
+const { requestChatCompletion, requestJson } = window.RPHubApiClient;
+const { buildApiEndpoint } = window.RPHubApiUtils;
 const {
     ActionConfirmModal,
     ActiveToolEditorModal,
@@ -11,6 +12,7 @@ const {
     CharacterExportModal,
     CharacterEditorModal,
     CharacterCard,
+    CharacterDeck,
     ContextViewerModal,
     EmbeddedViewContent,
     GenerationTimer,
@@ -37,10 +39,9 @@ const {
 const {
     compressImage,
     defaultAvatar,
-    extractApiErrorMessage,
-    extractApiUsageFromText,
     generateUUID,
     getApiUsagePayload,
+    getImageTagRegex,
     normalizeApiUsage,
     parseCot,
     stringifyErrorDetail
@@ -55,7 +56,6 @@ const {
     getVectorMemoryFingerprint,
     getVectorMemoryText,
     getVectorLexicalMatch,
-    hasVectorEmbedding,
     isEmbeddingLike,
     isEnabledVectorMemory,
     isVectorMemory,
@@ -77,7 +77,6 @@ const {
     buildContextViewerState,
     buildConversationTurnSnapshot: createConversationTurnSnapshot,
     escapeXmlAttribute,
-    escapeXmlText,
     getConversationTurnAtIndexFromSnapshot,
     getPostprocessedChatMessages: postprocessChatHistory,
     indentXmlText,
@@ -102,14 +101,14 @@ const {
     managedPresets: BUILTIN_PRESETS
 } = window.RPHubBuiltinPresets;
 const {
-    UI_TEMPLATE_UPDATES_PATTERN,
     applyUiTemplateUpdateListToTemplate,
     cloneUiObject,
     createExecutableHtmlIframe,
+    findUiTemplateUpdateBlock,
     inferInitialUiTemplateState,
     normalizeUiTemplate,
     normalizeUiTemplateUpdateList,
-    parseUiTemplateUpdateJson,
+    parseUiTemplateUpdates,
     renderUiTemplateHtml,
     sanitizeUiTemplateImportEntry,
     setUiTemplateValue,
@@ -134,10 +133,7 @@ const {
     setStoredValue,
     unwrapForStorage
 } = window.RPHubStorage;
-const {
-    prompts: BUILTIN_PROMPTS,
-    summaryLengthRequirements: SUMMARY_LENGTH_REQUIREMENTS
-} = window.RPHubBuiltinContent;
+const { prompts: BUILTIN_PROMPTS } = window.RPHubBuiltinContent;
 const {
     activeTools: activeToolConfig,
     apiProviderOptions,
@@ -162,6 +158,23 @@ marked.use({
     }
 });
 
+const RollingText = {
+    props: { value: { type: [String, Number], default: '' } },
+    setup(props) {
+        const text = computed(() => String(props.value ?? ''));
+        const characters = computed(() => Array.from(text.value));
+        return { characters, text };
+    },
+    template: `
+        <span class="inline-flex" :aria-label="text">
+            <span v-for="(character, index) in characters" :key="index" class="inline-grid overflow-hidden">
+                <transition name="usage-roll" appear>
+                    <span :key="character" class="col-start-1 row-start-1" aria-hidden="true">{{ character }}</span>
+                </transition>
+            </span>
+        </span>`
+};
+
 const app = createApp({
     components: {
         ActionConfirmModal,
@@ -172,6 +185,7 @@ const app = createApp({
         CharacterExportModal,
         CharacterEditorModal,
         CharacterCard,
+        CharacterDeck,
         CustomSelect: window.RPHubCustomSelect,
         ContextViewerModal,
         EmbeddedViewContent,
@@ -182,6 +196,7 @@ const app = createApp({
         PresetEditorModal,
         RegexEditorModal,
         RetryConfirmModal,
+        RollingText,
         SettingsHelp,
         SettingsPageHeader,
         StatusNoticeModal,
@@ -200,6 +215,7 @@ const app = createApp({
             fontFamilies: fontFamilyOptions,
             fontSizes: fontSizeOptions,
             imageCounts: imageGenCountOptions,
+            imageModels: imageModelOptions,
             imageSizes: imageSizeOptions,
             imageStyles: imageStyleOptions,
             popularModelFamilies,
@@ -208,7 +224,6 @@ const app = createApp({
             uiTemplatePlacements: uiTemplatePlacementOptions,
             worldInfoPositions: worldInfoPositionOptions
         } = uiOptions;
-        const ACTIVE_TOOL_VECTOR_TYPE = activeToolConfig.types.vector;
         const ACTIVE_TOOL_KEYWORD_TYPE = activeToolConfig.types.keyword;
         const ACTIVE_TOOL_WEB_TYPE = activeToolConfig.types.web;
         const ACTIVE_TOOL_MIN_RESULT_COUNT = activeToolConfig.resultCount.min;
@@ -225,7 +240,6 @@ const app = createApp({
         const ACTIVE_TOOL_TAVILY_EXTRACT_ENDPOINT = activeToolConfig.tavily.extractEndpoint;
         const ACTIVE_TOOL_TAVILY_SEARCH_DEPTH = activeToolConfig.tavily.searchDepth;
         const ACTIVE_TOOL_TAVILY_EXTRACT_MAX_URLS = ACTIVE_TOOL_DEFAULT_RESULT_COUNT;
-        const createDefaultActiveTool = () => ({ ...activeToolConfig.defaults[0] });
         const getDefaultActiveToolDefinitions = () => activeToolConfig.defaults.map(tool => ({ ...tool }));
 
         // --- State ---
@@ -292,8 +306,8 @@ const app = createApp({
         const showActiveToolEditor = ref(false);
         const showUserSetupModal = ref(false);
         const showAutoImageGenModal = ref(false);
-        const pendingActiveToolContext = ref('');
-        const activeToolResultContexts = ref([]);
+        // 仅保存本轮原生 assistant/tool 消息，不写入用户消息或长期记忆。
+        const activeToolMessages = [];
         const tempUserSetup = reactive({ name: '', description: '', person: 'second' });
         const characterDisplayLimit = ref(8);
         const hasOpenedCharacterManager = ref(false);
@@ -353,6 +367,7 @@ const app = createApp({
         let activeToolQueueAbortController = null;
         const abortController = ref(null);
         const userInput = ref('');
+        const pendingCardInteraction = ref('');
         const pendingChatImages = ref([]);
         const pendingChatImageReadCount = ref(0);
         let chatImageSelectionEpoch = 0;
@@ -383,7 +398,9 @@ const app = createApp({
                 scrollRevealObserver = new IntersectionObserver((entries) => {
                     entries.forEach(entry => {
                         if (entry.isIntersecting) {
+                            entry.target.dataset.revealed = 'true';
                             entry.target.classList.add('reveal-active');
+                            scrollRevealObserver.unobserve(entry.target);
                         }
                     });
                 }, {
@@ -398,7 +415,7 @@ const app = createApp({
             if (!scrollRevealObserver) initScrollReveal();
             if (scrollRevealObserver && newEls) {
                 newEls.forEach(el => {
-                    if (el instanceof HTMLElement && !el.classList.contains('reveal-active')) {
+                    if (el instanceof HTMLElement && el.dataset.revealed !== 'true' && !el.classList.contains('reveal-active')) {
                         scrollRevealObserver.observe(el);
                     }
                 });
@@ -550,6 +567,7 @@ const app = createApp({
         const user = reactive({
             name: '请前往设置自定义你的名称',
             description: '',
+            preferences: '',
             avatar: '',
             person: 'second', //记录人称偏好：second 或 third
         });
@@ -569,6 +587,7 @@ const app = createApp({
                     const currentProfile = userProfiles.value[profileIndex];
                     if (currentProfile.name !== newVal.name ||
                         currentProfile.description !== newVal.description ||
+                        currentProfile.preferences !== newVal.preferences ||
                         currentProfile.avatar !== newVal.avatar ||
                         currentProfile.person !== newVal.person) {
                         userProfiles.value[profileIndex] = JSON.parse(JSON.stringify(newVal));
@@ -591,13 +610,15 @@ const app = createApp({
             contextSize: MAX_CONTEXT_SIZE,
             temperature: 1.0,
             reasoningEffort: '',
-            autoFetchModels: true,
             stream: true,
             activeToolAggressiveness: 'adaptive',
             activeToolAggressivenessVersion: 2,
 
             useCharacterBackground: true,
             immersiveMode: false,
+            showLatestUsageBar: false,
+            preventTruncation: false,
+            styleFilterEnabled: true,
             uiTemplateEnabled: false,
             uiTemplateModel: '',
             uiTemplateAnalysisDepth: 4,
@@ -609,6 +630,7 @@ const app = createApp({
             imageGenKey: '',
             imageStyle: 'vertical',
             customImageArtists: '',
+            imageModel: 'nai-diffusion-4-5-full',
             imageSize: '竖图',
             imageGenCount: 2,
             qualityModel: DEFAULT_API_CONFIG.qualityModel,
@@ -616,6 +638,12 @@ const app = createApp({
             fastModel: DEFAULT_API_CONFIG.fastModel,
             visionModel: ''
         });
+        const v5UnsupportedImageStyles = new Set(['r18', 'lolita25d', 'anime']);
+        const availableImageStyleOptions = computed(() => settings.imageModel === 'nai-diffusion-5-full'
+            ? imageStyleOptions.filter(option => !v5UnsupportedImageStyles.has(option.value))
+            : imageStyleOptions);
+        const getImageModelName = (value) => (imageModelOptions.find(option => option.value === value)?.label
+            || imageModelOptions[0].label).replace(/（[^）]*）$/, '');
         const normalizeFontFamily = (value) => ['modern', 'serif', 'system'].includes(value) ? value : 'modern';
         const normalizeFontSize = (value) => {
             const size = Number(value);
@@ -743,10 +771,77 @@ const app = createApp({
             }
         };
 
-        // Listen for workshop ready message to trigger sync
-        window.addEventListener('message', (event) => {
+        let workshopImportPending = false;
+        let squareImportPending = false;
+        const getSquareFrame = () => document.querySelector(`iframe[src="${squareUrl.value}"]`);
+        // Each embedded page may only use its own message bridge.
+        window.addEventListener('message', async (event) => {
+            if (event.data?.type === 'RPH_FORUM_READY' || event.data?.type === 'RPH_FORUM_IMPORT_CARD') {
+                const iframe = getSquareFrame();
+                if (!iframe || event.source !== iframe.contentWindow || event.origin !== new URL(squareUrl.value).origin) return;
+                if (event.data.type === 'RPH_FORUM_READY') {
+                    event.source.postMessage({ type: 'RPHUB_IMPORT_READY' }, event.origin);
+                    return;
+                }
+                const { requestId, buffer } = event.data;
+                if (typeof requestId !== 'string' || !/^[\w-]{1,80}$/.test(requestId)) return;
+                const reply = (result) => event.source.postMessage({ type: 'RPHUB_IMPORT_RESULT', requestId, ...result }, event.origin);
+                if (squareImportPending) {
+                    reply({ error: '上一张角色卡仍在导入，请稍后再试' });
+                    return;
+                }
+                squareImportPending = true;
+                try {
+                    if (!(buffer instanceof ArrayBuffer) || !buffer.byteLength || buffer.byteLength > 100 * 1024 * 1024) {
+                        throw new Error('角色卡文件无效或超过 100 MB');
+                    }
+                    const { data } = cardUtils.parsePngCharacterData(buffer);
+                    const source = data?.data || data;
+                    if (!source || typeof source.name !== 'string' || !source.name.trim()) throw new Error('角色卡缺少有效名称');
+                    const avatar = await cardUtils.blobToDataUrl(new Blob([buffer], { type: 'image/png' }));
+                    const char = await importCharacterData(data, avatar, { activate: false });
+                    try {
+                        const index = characters.value.findIndex(item => item.uuid === char.uuid);
+                        if (!await selectCharacter(index, false, { silent: true })) throw new Error('切换未完成');
+                    } catch (error) {
+                        console.error('Square character switch failed:', error);
+                        throw new Error('角色卡已导入，但自动切换未完成，请在角色库手动选择，无需重复导入');
+                    }
+                    reply({ name: char.name });
+                } catch (error) {
+                    console.error('Square import failed:', error);
+                    reply({ error: error.message || '导入失败，请重试' });
+                } finally {
+                    squareImportPending = false;
+                }
+                return;
+            }
+
             if (event.data && event.data.type === 'WORKSHOP_READY') {
+                if (event.source !== document.querySelector('iframe[src*="character/index.html"]')?.contentWindow) return;
                 syncSettingsToGenerator();
+            }
+
+            if (event.data?.type === 'WORKSHOP_IMPORT_AND_PLAY') {
+                const iframe = document.querySelector('iframe[src*="character/index.html"]');
+                if (!iframe || event.source !== iframe.contentWindow || workshopImportPending) return;
+                workshopImportPending = true;
+                try {
+                    if (!event.data.card?.data || typeof event.data.card.data.name !== 'string' || !event.data.card.data.name.trim()) {
+                        throw new Error('角色卡缺少名称，请先完善角色卡');
+                    }
+                    const char = await importCharacterData(event.data.card, event.data.avatar, { askImageGeneration: false });
+                    if (currentCharacter.value?.uuid !== char.uuid || currentView.value !== 'chat') {
+                        throw new Error('角色卡已导入，暂时未能进入对话，请从角色卡管理中打开');
+                    }
+                } catch (error) {
+                    console.error('Workshop import failed:', error);
+                    event.source.postMessage({ type: 'WORKSHOP_IMPORT_RESULT', error: error.message || '导入失败，请重试' }, '*');
+                    showToast(error.message || '导入失败，请重试', 'error');
+                } finally {
+                    workshopImportPending = false;
+                }
+                return;
             }
 
             if (event.data?.type === 'REQUEST_RPHUB_API_SETTINGS') {
@@ -797,11 +892,13 @@ const app = createApp({
         }, { deep: true });
 
         // Watch image gen and model settings for sync
-        watch(() => [settings.imageGenKey, settings.imageStyle, settings.customImageArtists, settings.imageGenCount, settings.qualityModel, settings.balancedModel, settings.fastModel, settings.uiTemplateModel, settings.fontFamily, settings.fontFamilyVersion], () => {
+        watch(() => [settings.imageGenKey, settings.imageModel, settings.imageStyle, settings.customImageArtists, settings.imageGenCount, settings.qualityModel, settings.balancedModel, settings.fastModel, settings.uiTemplateModel, settings.fontFamily, settings.fontFamilyVersion], () => {
             syncSettingsToGenerator();
         });
 
         const currentModelMode = ref('quality');
+        const isGeminiModel = computed(() => /gemini/i.test(String(settings.model || '')));
+        const isTruncationEnabled = computed(() => isGeminiModel.value && settings.preventTruncation);
         const modelMode = computed({
             get: () => {
                 return currentModelMode.value;
@@ -821,10 +918,10 @@ const app = createApp({
         });
         const reasoningEffortOptions = [
             { value: 'none', label: '关闭' },
-            { value: 'low', label: '低' },
-            { value: 'medium', label: '中' },
-            { value: 'high', label: '高' },
-            { value: 'max', label: '最高' },
+            { value: 'low', label: '低（Low）' },
+            { value: 'medium', label: '中（Medium）' },
+            { value: 'high', label: '高（High）' },
+            { value: 'max', label: '最高（Max）' },
             { value: '', label: '默认' }
         ];
         const reasoningEffortSlider = computed({
@@ -875,6 +972,11 @@ const app = createApp({
         const isConversationBusy = computed(() => isGenerating.value || isRemoteGenerating.value || hasActiveToolInlineWork.value);
 
         const presets = ref([]);
+        // 抗截断只临时停用 COT，不改写用户保存的开关状态。
+        const isPresetEnabled = preset => preset.enabled !== false
+            && (preset.name !== 'COT' || !isTruncationEnabled.value);
+        const isStoryPanelsEnabled = computed(() => presets.value.some(preset => preset.name === BUILTIN_PRESETS.storyPanels.name
+            && preset.enabled !== false && String(preset.content || '').trim()));
         const normalizePresetRole = (role) => (
             ['system', 'user', 'assistant'].includes(role) ? role : 'system'
         );
@@ -930,23 +1032,60 @@ const app = createApp({
             if (role === 'assistant') return 'bg-purple-100 text-purple-700 border-purple-200';
             return 'bg-red-100 text-red-700 border-red-200';
         };
-        const blockedStyleSentencePattern = /[^。！？!?\n]*(?:不容置疑|(?:不易|难以)(?:察觉|觉察)|(?:微|几)不可察|一抹|弧度|生理性|像(?:是)?[^。！？!?\n]*?[，,]\s*又像(?:是)?|不是[^。！？!?\n]*?(?:而是|[，,]\s*(?:是|(?:更|倒|反倒)?像是)))[^。！？!?\n]*(?:[。！？!?]+[”’」』】）)]*(?:\*\*|__)?)?/g;
+        const blockedStyleSentencePattern = /[^。！？!?\n]*(?:不容置疑|(?:不易|难以)(?:察觉|觉察)|(?:微|几)不可察|一抹|弧度|生理性|微微泛|因为用力|像在|风箱|手术刀|上扬|带着一种|语气很平|声音很平|(?:指尖|指节|指关节)[^。！？!?\n]*(?:发白|泛白)|像(?:是)?[^。！？!?\n]*?[，,]\s*又像(?:是)?|不是[^。！？!?\n]*?(?:而是|就是|[，,]\s*(?:是|(?:更|倒|反倒)?像是)))[^。！？!?\n]*(?:[。！？!?]+[”’」』】）)]*(?:\*\*|__)?)?/g;
+        const standaloneWordCountSentencePattern = /(^|[。！？!?\n]+[”’」』】）)]*)[ \t]*(?:\*\*|__)?(?:\d+|[零〇一二两三四五六七八九十百千万]+)个字[^。！？!?\n]*(?:[。！？!?]+[”’」』】）)]*(?:\*\*|__)?)?/gm;
         const paleFingerClausePattern = /(?:^|[，,；;])[^，,。！？!?；;\n]*(?:指尖|指节|指关节)[^，,。！？!?；;\n]*(?:发白|泛白)[^，,。！？!?；;\n]*(?=$|[，,。！？!?；;\n])/gm;
+        const blockedStyleClausePattern = /(?:^|[，,；;])[^，,。！？!?；;\n*_]*(?:微微泛|因为用力|像在|风箱|手术刀|上扬|带着一种)[^，,。！？!?；;\n*_]*(?=(?:\*\*|__)?[ \t]*(?:$|[，,。！？!?；;\n]))/gm;
         const blockedStyleWordPattern = /极其/g;
         const quotedDialoguePattern = /(“[\s\S]*?”|『[\s\S]*?』|"[\s\S]*?")/g;
+        const standaloneRenderedContentPattern = /^(?:\s|<!--[\s\S]*?-->)*(?:```|<!doctype\b|<\?xml\b|<html\b|<(?:head|body|style|script|template|svg|canvas|iframe|div|section|article|aside|header|footer|main|nav|form|table|ul|ol|pre|p|img)\b)/i;
+        const isStandaloneRenderedContent = text => standaloneRenderedContentPattern.test(String(text || ''));
         const loggedBlockedStyleFragments = new Set();
-        const filterBlockedStyleText = (text, { log = false } = {}) => {
+        const openStyleFilterMessageKey = ref('');
+        const getStyleFilterMessageKey = (message, index) => String(message?.id || `message-${index}`);
+        const isStyleFilterDetailsOpen = (message, index) => (
+            openStyleFilterMessageKey.value === getStyleFilterMessageKey(message, index)
+        );
+        const toggleStyleFilterDetails = (message, index) => {
+            const key = getStyleFilterMessageKey(message, index);
+            openStyleFilterMessageKey.value = openStyleFilterMessageKey.value === key ? '' : key;
+        };
+        const normalizeStyleFilterHit = fragment => String(fragment || '')
+            .trim()
+            .replace(/^[，,；;]\s*/, '')
+            .replace(/^(?:\*\*|__)/, '')
+            .replace(/(?:\*\*|__)$/, '')
+            .trim();
+        const styleFilterHighlightPattern = /(?:不容置疑|(?:不易|难以)(?:察觉|觉察)|(?:微|几)不可察|一抹|弧度|生理性|微微泛|因为用力|像在|风箱|手术刀|上扬|带着一种|语气很平|声音很平|(?:\d+|[零〇一二两三四五六七八九十百千万]+)个字|指尖|指节|指关节|发白|泛白|不是|而是|就是|又像(?:是)?|(?:更|倒|反倒)?像是|极其)/g;
+        const getStyleFilterHitSegments = fragment => {
+            const text = String(fragment || '');
+            const segments = [];
+            let lastIndex = 0;
+            for (const match of text.matchAll(styleFilterHighlightPattern)) {
+                if (match.index > lastIndex) segments.push({ text: text.slice(lastIndex, match.index), matched: false });
+                segments.push({ text: match[0], matched: true });
+                lastIndex = match.index + match[0].length;
+            }
+            if (lastIndex < text.length) segments.push({ text: text.slice(lastIndex), matched: false });
+            return segments.length ? segments : [{ text, matched: false }];
+        };
+        const filterBlockedStyleText = (text, { log = false, collect = null } = {}) => {
             const source = String(text || '');
+            if (!settings.styleFilterEnabled) return source;
+            if (isStandaloneRenderedContent(source)) return source;
             const removedFragments = [];
-            const structuredIndexes = ['<ui_template_updates>', '{"updates"']
-                .map(marker => source.lastIndexOf(marker))
-                .filter(index => index >= 0);
-            const structuredIndex = structuredIndexes.length ? Math.min(...structuredIndexes) : source.length;
-            const filtered = cardUtils.transformUnprotectedText(source.slice(0, structuredIndex), part => part
+            const updateBlock = findUiTemplateUpdateBlock(source);
+            const filterEnd = updateBlock?.index ?? source.length;
+            const filtered = cardUtils.transformUnprotectedText(source.slice(0, filterEnd), part => part
                 .split(quotedDialoguePattern)
                 .map((fragment, index) => index % 2 ? fragment : fragment
+                    .replace(standaloneWordCountSentencePattern, (match, prefix = '') => {
+                        removedFragments.push(match.slice(prefix.length).trim());
+                        return prefix;
+                    })
                     .replace(blockedStyleSentencePattern, match => { removedFragments.push(match.trim()); return ''; })
                     .replace(paleFingerClausePattern, match => { removedFragments.push(match.trim()); return ''; })
+                    .replace(blockedStyleClausePattern, match => { removedFragments.push(match.trim()); return ''; })
                     .replace(blockedStyleWordPattern, match => { removedFragments.push(match); return ''; })
                     .replace(/^[ \t]*[，,；;]+/gm, '')
                     .replace(/[，,；;]{2,}/g, marks => marks.at(-1))
@@ -954,12 +1093,15 @@ const app = createApp({
                     .replace(/[ \t]+\n/g, '\n')
                     .replace(/\n{3,}/g, '\n\n'))
                 .join(''));
+            if (Array.isArray(collect)) {
+                collect.push(...removedFragments.map(normalizeStyleFilterHit).filter(Boolean));
+            }
             if (log) {
                 const newFragments = removedFragments.filter(fragment => fragment && !loggedBlockedStyleFragments.has(fragment));
                 newFragments.forEach(fragment => loggedBlockedStyleFragments.add(fragment));
                 if (newFragments.length) console.info(`[文风过滤] 已过滤 ${newFragments.length} 处`, newFragments);
             }
-            return filtered + source.slice(structuredIndex);
+            return filtered + source.slice(filterEnd);
         };
         const getPostprocessedChatMessages = (messages = chatHistory.value, options = {}) => (
             postprocessChatHistory(messages, options).map(message => message.role === 'assistant'
@@ -978,6 +1120,23 @@ const app = createApp({
             const snapshot = buildConversationTurnSnapshot();
             return snapshot.turns[snapshot.turns.length - 1] || null;
         };
+
+        const latestDeletableMessageIndexes = computed(() => {
+            let latestUserIndex = -1;
+            for (let index = chatHistory.value.length - 1; index >= 0; index--) {
+                if (chatHistory.value[index]?.role === 'user') {
+                    latestUserIndex = index;
+                    break;
+                }
+            }
+            if (latestUserIndex < 0) return new Set();
+            const indexes = new Set([latestUserIndex]);
+            for (let index = latestUserIndex + 1; index < chatHistory.value.length; index++) {
+                if (['assistant', 'system'].includes(chatHistory.value[index]?.role)) indexes.add(index);
+            }
+            return indexes;
+        });
+        const canDeleteMessage = (index) => latestDeletableMessageIndexes.value.has(index);
 
         const regexScripts = ref([]);
         const globalRegexScripts = ref([]);
@@ -1005,13 +1164,13 @@ const app = createApp({
         const MEMORY_VECTOR_MIN_TOP_K = 10;
         const MEMORY_VECTOR_MAX_TOP_K = 20;
         const MEMORY_VECTOR_DEFAULT_TOP_K = 10;
-        const MEMORY_VECTOR_MIN_SIMILARITY = 40;
-        const MEMORY_VECTOR_MAX_SIMILARITY = 65;
-        const MEMORY_VECTOR_DEFAULT_SIMILARITY = 50;
+        const MEMORY_VECTOR_SIMILARITY_THRESHOLD = 45;
         const MEMORY_VECTOR_DEFAULT_DEPTH = 1;
         const CLASSIC_MEMORY_MIN_CONCURRENCY = 1;
         const CLASSIC_MEMORY_MAX_CONCURRENCY = 10;
         const CLASSIC_MEMORY_DEFAULT_CONCURRENCY = 5;
+        const CLASSIC_SECONDARY_KEEP_TURNS = 25;
+        const CLASSIC_SECONDARY_GROUP_SIZE = 5;
         const MEMORY_MODE_VECTOR = 'vector';
         const MEMORY_MODE_CLASSIC = 'classic';
         const VECTOR_KEEP_FLOORS_MIN = 30;
@@ -1020,7 +1179,6 @@ const app = createApp({
         const SUMMARY_KEEP_FLOORS_MIN = 10;
         const SUMMARY_KEEP_FLOORS_MAX = 40;
         const SUMMARY_KEEP_FLOORS_DEFAULT = 20;
-        const SUMMARY_LEVEL_DEFAULT = 'balanced';
         const LIST_PAGE_SIZE = 10;
         const memories = ref([]);
         const classicMemories = ref([]);
@@ -1031,11 +1189,8 @@ const app = createApp({
             embeddingModel: '',
             classicModel: '',
             vectorTopK: MEMORY_VECTOR_DEFAULT_TOP_K,
-            similarityThreshold: MEMORY_VECTOR_DEFAULT_SIMILARITY,
-            defaultDepth: MEMORY_VECTOR_DEFAULT_DEPTH,
             vectorKeepFloors: VECTOR_KEEP_FLOORS_DEFAULT,
             summaryKeepFloors: SUMMARY_KEEP_FLOORS_DEFAULT,
-            summaryLevel: SUMMARY_LEVEL_DEFAULT,
             classicConcurrency: CLASSIC_MEMORY_DEFAULT_CONCURRENCY
         });
         const isBatchExtracting = ref(false);
@@ -1100,7 +1255,7 @@ const app = createApp({
             if (!memorySettings.classicModel && memorySettings.model) {
                 memorySettings.classicModel = String(memorySettings.model).trim();
             }
-            ['model', 'autoExtract', 'keepFloors', `re${'rankEnabled'}`, `re${'rankModel'}`].forEach(key => {
+            ['model', 'autoExtract', 'keepFloors', 'similarityThreshold', 'summaryLevel', 'defaultDepth', `re${'rankEnabled'}`, `re${'rankModel'}`].forEach(key => {
                 delete memorySettings[key];
             });
             memorySettings.mode = memorySettings.mode === MEMORY_MODE_CLASSIC
@@ -1121,19 +1276,11 @@ const app = createApp({
                 SUMMARY_KEEP_FLOORS_MAX,
                 SUMMARY_KEEP_FLOORS_DEFAULT
             );
-            if (!SUMMARY_LENGTH_REQUIREMENTS[memorySettings.summaryLevel]) {
-                memorySettings.summaryLevel = SUMMARY_LEVEL_DEFAULT;
-            }
             memorySettings.classicConcurrency = normalizeClassicMemoryConcurrency(memorySettings.classicConcurrency);
             const vectorTopK = Number(memorySettings.vectorTopK);
             memorySettings.vectorTopK = Number.isFinite(vectorTopK)
                 ? Math.max(MEMORY_VECTOR_MIN_TOP_K, Math.min(MEMORY_VECTOR_MAX_TOP_K, vectorTopK))
                 : MEMORY_VECTOR_DEFAULT_TOP_K;
-            const similarityThreshold = Number(memorySettings.similarityThreshold);
-            memorySettings.similarityThreshold = Number.isFinite(similarityThreshold)
-                ? Math.max(MEMORY_VECTOR_MIN_SIMILARITY, Math.min(MEMORY_VECTOR_MAX_SIMILARITY, Math.round(similarityThreshold)))
-                : MEMORY_VECTOR_DEFAULT_SIMILARITY;
-            memorySettings.defaultDepth = MEMORY_VECTOR_DEFAULT_DEPTH;
         };
 
         const normalizeActiveToolCallName = (value) => {
@@ -1143,7 +1290,7 @@ const app = createApp({
             return source
                 .replace(/[<>：:]/g, '')
                 .replace(/\s+/g, '_')
-                .trim() || 'tool_memory';
+                .trim() || 'tool_grep';
         };
 
         const normalizeActiveToolBaseCallName = (value) => normalizeActiveToolCallName(value)
@@ -1155,21 +1302,7 @@ const app = createApp({
 
         const normalizeActiveTool = (tool = {}) => {
             const resultCount = Number(tool.resultCount);
-            const rawCallName = normalizeActiveToolBaseCallName(tool.callName || tool.callPattern || 'tool_memory');
-            const removedWorldToolNames = [
-                'tool_world',
-                'tool_world_add',
-                'tool_world_cover',
-                'tool_world_list',
-                'tool_world_read',
-                'tool_world_edit'
-            ];
-            const isRemovedWorldTool = removedWorldToolNames.includes(rawCallName)
-                || ['world_info', 'world_info_list', 'world_info_read', 'world_info_edit'].includes(tool.type)
-                || removedWorldToolNames.includes(tool.id);
-            if (isRemovedWorldTool) {
-                return null;
-            }
+            const rawCallName = normalizeActiveToolBaseCallName(tool.callName || tool.callPattern || 'tool_grep');
             const isLegacyWebTool = rawCallName === 'tool_web'
                 || ['web_search', 'tavily', 'tavily_search'].includes(tool.type)
                 || ['tool_web', 'tool_web_add', 'tool_web_cover'].includes(tool.id)
@@ -1177,38 +1310,32 @@ const app = createApp({
             const callName = isLegacyWebTool ? 'tool_web' : rawCallName;
             const defaultTool = getDefaultActiveToolDefinitions()
                 .find(item => item.id === (isLegacyWebTool ? 'tool_web' : tool.id) || item.callName === callName);
-            const fallback = defaultTool || createDefaultActiveTool();
-            const normalizedCallName = defaultTool ? defaultTool.callName : callName;
+            if (!defaultTool) return null;
+            const fallback = defaultTool;
+            const normalizedCallName = fallback.callName;
             const resultCountVersion = Number(tool.resultCountVersion) || 1;
-            const isDefaultTool = !!defaultTool;
-            const normalizedType = isDefaultTool ? fallback.type : (tool.type || fallback.type || ACTIVE_TOOL_VECTOR_TYPE);
-            const description = isDefaultTool
-                ? fallback.description
-                : String(tool.description || fallback.description).trim();
+            const normalizedType = fallback.type;
             const countMin = getActiveToolResultCountMin({ type: normalizedType });
             const countMax = getActiveToolResultCountMax({ type: normalizedType });
             let normalizedResultCount = Number.isFinite(resultCount)
                 ? Math.max(countMin, Math.min(countMax, Math.round(resultCount)))
                 : (fallback.resultCount || ACTIVE_TOOL_DEFAULT_RESULT_COUNT);
             if (resultCountVersion < ACTIVE_TOOL_RESULT_COUNT_VERSION
-                && isDefaultTool
                 && normalizedCallName === fallback.callName
                 && normalizedType !== ACTIVE_TOOL_WEB_TYPE
                 && (!Number.isFinite(resultCount) || Math.round(resultCount) <= ACTIVE_TOOL_MIN_RESULT_COUNT || Math.round(resultCount) === 10)) {
                 normalizedResultCount = ACTIVE_TOOL_DEFAULT_RESULT_COUNT;
             }
             const normalized = {
-                id: isDefaultTool ? fallback.id : (tool.id || generateUUID()),
-                name: isDefaultTool ? fallback.name : (String(tool.name || fallback.name).trim() || fallback.name),
+                id: fallback.id,
+                name: fallback.name,
                 enabled: tool.enabled !== false,
                 type: normalizedType,
                 callName: normalizedCallName,
                 resultCount: normalizedResultCount,
                 resultCountVersion: ACTIVE_TOOL_RESULT_COUNT_VERSION,
-                description: description || fallback.description,
-                displayDescription: isDefaultTool
-                    ? fallback.displayDescription
-                    : (String(tool.displayDescription || fallback.displayDescription).trim() || fallback.displayDescription)
+                description: fallback.description,
+                displayDescription: fallback.displayDescription
             };
             if (normalizedType === ACTIVE_TOOL_WEB_TYPE) {
                 normalized.tavilyApiKey = String(tool.tavilyApiKey || tool.apiKey || fallback.tavilyApiKey || '').trim();
@@ -1304,6 +1431,9 @@ const app = createApp({
         const editingCharacter = reactive({ id: undefined, data: {} });
         const editorTab = ref('basic'); // 'basic', 'description', 'personality', 'first_mes'
         const isBatchDeleteMode = ref(false);
+        const characterGridView = ref(false);
+        const characterDeck = ref(null);
+        const useCharacterDeck = computed(() => !isBatchDeleteMode.value && !characterGridView.value);
         const selectedCharacterIndices = ref(new Set());
         const editingPreset = reactive({ id: undefined, data: {} });
         const editingUiTemplate = reactive({ id: undefined, data: {}, tab: 'history' });
@@ -1312,8 +1442,6 @@ const app = createApp({
         const worldInfoKeysText = ref('');
         const editingActiveTool = reactive({ id: undefined, data: {} });
 
-        const sysInstruction = ref('');
-        const showInstructionPanel = ref(false);
         const showContextViewerModal = ref(false);
         const showStoryBranchModal = ref(false);
         const showStoryBranchNameEditor = ref(false);
@@ -1331,12 +1459,16 @@ const app = createApp({
             (total, message) => total + String(message?.content || '').length,
             0
         ));
+        const lastContextFloorCount = computed(() => lastContextMessages.value
+            .filter(message => Number.isFinite(message?.floor)).length);
         const CHARACTER_SCOPED_STORAGE_NAMES = ['chat', 'memories', 'classic_memories', 'branches'];
         const {
             clearTokenUsageHistory,
             displayedTokenUsageHistory,
             filteredTokenUsageHistory,
             formatTokenAggregate,
+            formatLatestTokenCount,
+            formatLatestUsageCost,
             formatTokenCount,
             formatTokenUsageTime,
             getTokenUsageTypeLabel,
@@ -1351,7 +1483,8 @@ const app = createApp({
             tokenUsageStats,
             tokenUsageTimeFilter,
             tokenUsageTimeFilterLabel,
-            tokenUsageTimeFilterOptions
+            tokenUsageTimeFilterOptions,
+            latestMainTokenUsage
         } = useTokenUsage({
             pageSize: LIST_PAGE_SIZE,
             cloneForStorage,
@@ -1360,11 +1493,19 @@ const app = createApp({
                 if (!getMainDb()) await initDB();
             },
             generateUUID,
-            getCharacterName: () => currentCharacter.value?.name || '',
+            getApiKey: () => settings.apiKey,
+            getApiUrl: () => settings.apiUrl,
             normalizeApiUsage,
             saveStoredValue: setStoredValue,
             toast: (...args) => showToast(...args)
         });
+        const requestTrackedChatCompletion = (options, type) => {
+            const apiUrl = settings.apiUrl;
+            const request = { url: buildApiEndpoint(apiUrl, 'chat/completions'), apiKey: settings.apiKey, ...options };
+            return requestChatCompletion({ ...request, onUsage: (usage, metrics) => recordApiUsage(usage, {
+                type, model: request.model, apiUrl, apiKey: request.apiKey, ...metrics
+            }) });
+        };
         const {
             cleanupUnusedStorage,
             formatStorageSize,
@@ -1434,6 +1575,7 @@ const app = createApp({
 
         const onSquareLoad = () => {
             isSquareLoading.value = false;
+            getSquareFrame()?.contentWindow.postMessage({ type: 'RPHUB_IMPORT_READY' }, new URL(squareUrl.value).origin);
         };
 
         // Novel State
@@ -1469,6 +1611,9 @@ const app = createApp({
         watch(currentView, (newView) => {
             settingsHelpTopic.value = '';
             if (newView === 'characters') {
+                characterGridView.value = false;
+                isBatchDeleteMode.value = false;
+                selectedCharacterIndices.value.clear();
                 hasOpenedCharacterManager.value = true;
             } else if (newView === 'generator') {
                 isGeneratorLoading.value = true;
@@ -1730,6 +1875,14 @@ const app = createApp({
                 settings.fontFamily = normalizeFontFamily(settings.fontFamily);
                 settings.fontSize = normalizeFontSize(settings.fontSize);
                 if (settings.reasoningEffort === 'xhigh') settings.reasoningEffort = 'max';
+                if (!imageModelOptions.some(option => option.value === settings.imageModel)) {
+                    settings.imageModel = imageModelOptions[0].value;
+                }
+                if (!imageSizeOptions.some(option => option.value === settings.imageSize)) {
+                    const legacySize = String(settings.imageSize || '');
+                    settings.imageSize = legacySize.includes('横') ? '横图' : legacySize.includes('方') ? '方图' : '竖图';
+                }
+                settings.imageGenCount = Math.min(8, Math.max(2, Math.round(Number(settings.imageGenCount) || 2)));
                 settings.fontFamilyVersion = 4;
                 applyFontFamily(settings.fontFamily);
                 delete settings.renderLayerLimit;
@@ -1781,7 +1934,7 @@ const app = createApp({
                 const savedActiveId = await getStoredValue('active_profile_id');
 
                 if (savedProfiles && savedProfiles.length > 0) {
-                    userProfiles.value = savedProfiles;
+                    userProfiles.value = savedProfiles.map(profile => ({ ...profile, preferences: String(profile?.preferences || '') }));
                     activeProfileId.value = savedActiveId || savedProfiles[0].uuid;
                     const activeProfile = userProfiles.value.find(p => p.uuid === activeProfileId.value);
                     if (activeProfile) {
@@ -2078,8 +2231,8 @@ const app = createApp({
             const cards = [...event.currentTarget.querySelectorAll('.generated-image-card')];
             const imageIndex = cards.indexOf(card);
             const message = chatHistory.value[messageIndex];
-            const mainText = parseCot(message?.content || '').main;
-            const imageMatches = [...mainText.matchAll(/image###([\s\S]*?)###/g)];
+            const sourceText = String(message?.content || '');
+            const imageMatches = cardUtils.findUnprotectedMatches(sourceText, getImageTagRegex());
             const imageMatch = imageMatches[imageIndex];
             if (!message || imageIndex < 0 || !imageMatch) return;
             if (card.classList.contains('is-rerolling')) return;
@@ -2092,11 +2245,9 @@ const app = createApp({
             const swapIndex = Math.floor(Math.random() * (tags.length - 1));
             [tags[swapIndex], tags[swapIndex + 1]] = [tags[swapIndex + 1], tags[swapIndex]];
             const updatedToken = `image###${tags.join(', ')}###`;
-            const updatedMainText = mainText.slice(0, imageMatch.index)
+            const updatedContent = sourceText.slice(0, imageMatch.index)
                 + updatedToken
-                + mainText.slice(imageMatch.index + imageMatch[0].length);
-            const mainStart = message.content.lastIndexOf(mainText);
-            if (mainStart < 0) return;
+                + sourceText.slice(imageMatch.index + imageMatch[0].length);
             const sourceUrl = card.dataset.imageRequest || card.querySelector('img')?.getAttribute('src');
             if (!sourceUrl) return;
             const nextImageUrl = new URL(sourceUrl, window.location.href);
@@ -2117,9 +2268,7 @@ const app = createApp({
                     finishLoading();
                     return;
                 }
-                message.content = originalContent.slice(0, mainStart)
-                    + updatedMainText
-                    + originalContent.slice(mainStart + mainText.length);
+                message.content = updatedContent;
                 message.shouldAnimate = false;
                 scheduleChatHistorySave();
                 showToast('已重新生成图片', 'success');
@@ -2141,14 +2290,16 @@ const app = createApp({
             const targetArtists = cardUtils.getImageStyleArtists(settings.imageStyle, settings.customImageArtists);
             const styleName = imageStyleOptions.find(option => option.value === settings.imageStyle)?.label
                 || imageStyleOptions[0].label;
+            const modelName = getImageModelName(settings.imageModel);
 
-            // 动态替换 URL 中的 artist 和 size 参数
+            // 动态替换 URL 中的 model、artist 和 size 参数
             const encodedTargetArtists = encodeURIComponent(targetArtists);
             const oldReplacement = regex.replacement;
             let newReplacement = oldReplacement.replace(/artist=[\s\S]*?(&size=)/, 'artist=' + encodedTargetArtists + '$1');
             if (newReplacement === oldReplacement) {
                 newReplacement = oldReplacement.replace(/artist=[^&]+/, 'artist=' + encodedTargetArtists);
             }
+            newReplacement = newReplacement.replace(/model=[^&]+/, 'model=' + settings.imageModel);
             newReplacement = newReplacement.replace(/size=[^&]+/, 'size=' + settings.imageSize);
             regex.replacement = newReplacement;
 
@@ -2157,6 +2308,10 @@ const app = createApp({
             const oldArtist = oldReplacement.match(/artist=([\s\S]*?)&size=/)?.[1] || oldReplacement.match(/artist=([^&]+)/)?.[1];
             if (oldArtist !== encodedTargetArtists) {
                 messages.push(styleName);
+            }
+            const oldModel = oldReplacement.match(/model=([^&]+)/)?.[1];
+            if (oldModel !== settings.imageModel) {
+                messages.push(modelName);
             }
             // 检查 Size 变化
             const oldSize = oldReplacement.match(/size=([^&]+)/)?.[1];
@@ -2198,6 +2353,16 @@ const app = createApp({
                 updateImageGenRegexState({ enableRegex: isAutoImageGenEnabled.value });
             }
         });
+
+        watch(() => settings.imageModel, (imageModel) => {
+            if (imageModel === 'nai-diffusion-5-full' && v5UnsupportedImageStyles.has(settings.imageStyle)) {
+                settings.imageStyle = 'vertical';
+            }
+            const messages = updateImageGenRegexState({ enableRegex: isAutoImageGenEnabled.value });
+            if (isAutoImageGenEnabled.value && messages && messages.length > 0) {
+                showToast(`生图版本已切换：${getImageModelName(imageModel)}`, 'success');
+            }
+        }, { flush: 'sync' });
 
         watch(() => settings.imageSize, () => {
             const messages = updateImageGenRegexState({ enableRegex: isAutoImageGenEnabled.value });
@@ -2320,6 +2485,9 @@ const app = createApp({
             .sort((a, b) => (Number(b.template.order) || 0) - (Number(a.template.order) || 0) || a.index - b.index)
             .map(item => item.template));
         const activeUiTemplates = computed(() => currentUiTemplates.value.filter(t => t.enabled !== false));
+        const isUiTemplateAnalysisEnabled = () => settings.uiTemplateEnabled
+            && settings.uiTemplateMainModelAnalysis
+            && activeUiTemplates.value.length > 0;
 
         const handleUiTemplateClick = (event) => {
             const trigger = event.target?.closest?.('[data-slash]');
@@ -2345,6 +2513,10 @@ const app = createApp({
         };
 
         const getLastAssistantMessage = () => [...chatHistory.value].reverse().find(msg => msg && msg.role === 'assistant');
+        const summarizeUiTemplateFailure = (reason) => {
+            const text = String(reason || 'UI模板变量校验失败').replace(/\s+/g, ' ').trim();
+            return text.length > 800 ? `${text.slice(0, 797)}...` : text;
+        };
         const buildMainModelUiTemplateUpdatePrompt = () => {
             if (!settings.uiTemplateEnabled || !settings.uiTemplateMainModelAnalysis) return '';
             const templates = activeUiTemplates.value;
@@ -2369,34 +2541,35 @@ const app = createApp({
                 return { handled: false, changed: false };
             }
             delete targetMessage.uiTemplateAnalysisFailure;
-            const recordFailure = (result, reason) => {
+            const recordFailure = (reason) => {
+                const summary = summarizeUiTemplateFailure(reason);
                 targetMessage.uiTemplateAnalysisFailure = {
-                    result,
-                    reason,
+                    summary,
+                    reason: summary,
                     sourceMessageId: targetMessage.id || null
                 };
                 failUiTemplateAnalysis('变量分析失败，下次请求将自动修正', targetMessage.id || null);
-                console.warn('[UI模板] 主模型变量分析失败:', reason, result);
+                console.warn('[UI模板] 主模型变量分析失败:', summary);
                 return { handled: true, changed: false };
             };
-            const match = String(targetMessage.content || '').match(UI_TEMPLATE_UPDATES_PATTERN);
+            const match = findUiTemplateUpdateBlock(targetMessage.content);
             if (!match) {
                 const missingTemplates = templates
                     .map(template => `模板“${template.name || '未命名'}”（ID：${template.id}）`)
                     .join('；');
-                return recordFailure(`未输出：${missingTemplates}`, `未输出UI模板变量块：${missingTemplates}`);
+                return recordFailure(`未输出UI模板变量块：${missingTemplates}`);
             }
 
             let updates = [];
             try {
-                const updateJson = match[1] || match[2];
-                const parsed = parseUiTemplateUpdateJson(updateJson);
+                const updateContent = match[1];
+                const parsed = parseUiTemplateUpdates(updateContent, templates);
                 updates = normalizeUiTemplateUpdateList(parsed, templates);
             } catch (e) {
                 const reason = e instanceof SyntaxError
-                    ? `JSON格式错误：${e.message}`
+                    ? `变量块格式错误：${e.message}`
                     : e.message;
-                return recordFailure(e?.jsonSource || match[1] || match[2], reason);
+                return recordFailure(reason);
             }
 
             const targetMessageIndex = chatHistory.value.findIndex(msg => msg === targetMessage || (targetMessage.id && msg.id === targetMessage.id));
@@ -2405,9 +2578,7 @@ const app = createApp({
             updates.forEach(update => {
                 const targets = update?.id
                     ? activeUiTemplates.value.filter(template => template.id === update.id)
-                    : (update?.name
-                        ? activeUiTemplates.value.filter(template => template.name === update.name)
-                        : (activeUiTemplates.value.length === 1 ? [activeUiTemplates.value[0]] : []));
+                    : (activeUiTemplates.value.length === 1 ? [activeUiTemplates.value[0]] : []);
                 targets.forEach(template => {
                     const result = applyUiTemplateUpdateListToTemplate(template, [update], { model, turn, source: 'main_model' });
                     if (result.changed) {
@@ -2463,12 +2634,11 @@ const app = createApp({
             const userMessage = chatHistory.value[userIndex];
             const failure = failureMessage.uiTemplateAnalysisFailure;
             const correctionPrompt = BUILTIN_PROMPTS.buildMainModelUiTemplateCorrectionPrompt({
-                failedResult: failure.result,
+                failureSummary: failure.summary || summarizeUiTemplateFailure(failure.reason),
                 failureReason: failure.reason
             });
             userMessage.uiTemplateCorrection = {
-                result: failure.result,
-                reason: failure.reason,
+                summary: failure.summary || summarizeUiTemplateFailure(failure.reason),
                 sourceMessageId: failure.sourceMessageId || failureMessage.id || null
             };
             delete failureMessage.uiTemplateAnalysisFailure;
@@ -2618,56 +2788,6 @@ const app = createApp({
             }
 
             return { logs: removedLogs, blocks: removedBlocks };
-        };
-
-        const removeUiTemplateChangesForTurn = (turn, {
-            beforeSnapshot = buildConversationTurnSnapshot(),
-            beforeHistory = chatHistory.value,
-            shiftLaterTurns = true
-        } = {}) => {
-            if (!Number.isFinite(turn) || turn < 1) return { logs: 0, blocks: 0 };
-            let changedLogs = 0;
-            currentUiTemplates.value.forEach(template => {
-                const logs = Array.isArray(template.changeLog) ? template.changeLog : [];
-                const removedLogs = logs.filter(log => Number(log.turn) === turn);
-                const nextLogs = logs.filter(log => Number(log.turn) !== turn).map(log => (
-                    shiftLaterTurns && Number(log.turn) > turn ? { ...log, turn: Number(log.turn) - 1 } : log
-                ));
-                const nextLog = [...nextLogs]
-                    .filter(log => Number(log.turn) >= (shiftLaterTurns ? turn : turn + 1))
-                    .sort((a, b) => Number(a.turn) - Number(b.turn) || Number(a.time) - Number(b.time))[0];
-                const removedChanges = {};
-                [...removedLogs].sort((a, b) => Number(a.time) - Number(b.time)).forEach(log => {
-                    Object.entries(log.changes || {}).forEach(([key, change]) => {
-                        removedChanges[key] = removedChanges[key]
-                            ? { ...removedChanges[key], to: change.to }
-                            : change;
-                    });
-                });
-                if (removedLogs.length && nextLog) {
-                    nextLog.changes ||= {};
-                    Object.entries(removedChanges).forEach(([key, change]) => {
-                        nextLog.changes[key] = nextLog.changes[key]
-                            ? { ...nextLog.changes[key], from: change.from }
-                            : change;
-                    });
-                } else if (removedLogs.length) {
-                    rebuildUiTemplateStateFromLogs(template, nextLogs);
-                }
-                if (removedLogs.length || (shiftLaterTurns && logs.some(log => Number(log.turn) > turn))) changedLogs++;
-                template.changeLog = nextLogs;
-            });
-
-            let removedBlocks = 0;
-            const affectedTurn = (beforeSnapshot?.turns || []).find(turnInfo => Number(turnInfo.turn) === turn);
-            (affectedTurn?.sourceIndexes || []).forEach(index => {
-                const message = beforeHistory[index];
-                if (message?.role === 'assistant' && message.uiTemplateBlocks) {
-                    delete message.uiTemplateBlocks;
-                    removedBlocks++;
-                }
-            });
-            return { logs: changedLogs, blocks: removedBlocks };
         };
 
         const resetUiTemplateRuntimeState = () => {
@@ -2948,14 +3068,33 @@ const app = createApp({
             selectStoryBranchNode(branchId);
         };
 
+        const isSecondaryClassicMemory = (memory) => memory?.secondaryCompressed === true;
+        const getClassicMemoryTurnRange = (memory) => {
+            const fallbackTurn = Math.max(1, Number(memory?.turn) || 1);
+            const start = Math.max(1, Number(memory?.turnStart) || fallbackTurn);
+            const end = Math.max(start, Number(memory?.turnEnd) || fallbackTurn);
+            return { start, end };
+        };
+        const getClassicSecondaryMemoryMarker = (memory) => {
+            const range = getClassicMemoryTurnRange(memory);
+            return `总结记忆 第 ${range.start}-${range.end} 轮`;
+        };
+
         const buildClassicMemoryLookup = () => {
             const byAssistantId = new Map();
             const byTurn = new Map();
+            const secondaryByAssistantId = new Map();
+            const secondaryRanges = [];
             classicMemories.value.filter(memory => memory.enabled !== false).forEach(memory => {
+                if (isSecondaryClassicMemory(memory)) {
+                    (memory.sourceAssistantIds || []).forEach(id => secondaryByAssistantId.set(id, memory));
+                    secondaryRanges.push({ memory, ...getClassicMemoryTurnRange(memory) });
+                    return;
+                }
                 (memory.sourceAssistantIds || []).forEach(id => byAssistantId.set(id, memory));
                 if (memory.turn > 0 && !byTurn.has(memory.turn)) byTurn.set(memory.turn, memory);
             });
-            return { byAssistantId, byTurn };
+            return { byAssistantId, byTurn, secondaryByAssistantId, secondaryRanges };
         };
 
         const findClassicMemoryForTurn = (turnInfo, lookup) => {
@@ -2964,6 +3103,14 @@ const app = createApp({
                 .filter(Boolean);
             return sourceIds.map(id => lookup.byAssistantId.get(id)).find(Boolean)
                 || lookup.byTurn.get(turnInfo.turn);
+        };
+
+        const findSecondaryClassicMemoryForTurn = (turnInfo, lookup) => {
+            const sourceIds = (turnInfo.assistant?._sourceIndexes || [])
+                .map(index => chatHistory.value[index]?.id)
+                .filter(Boolean);
+            return sourceIds.map(id => lookup.secondaryByAssistantId.get(id)).find(Boolean)
+                || lookup.secondaryRanges.find(range => turnInfo.turn >= range.start && turnInfo.turn <= range.end)?.memory;
         };
 
         const summaryCompressedBodyLength = computed(() => {
@@ -2978,20 +3125,41 @@ const app = createApp({
 
             const lookup = buildClassicMemoryLookup();
             const snapshot = buildConversationTurnSnapshot(messages, { alreadyPostprocessed: true });
-            snapshot.turns.forEach(turnInfo => {
-                const assistantIndex = turnInfo.messageIndexes[1];
-                if (assistantIndex >= candidateCount) return;
-                const memory = findClassicMemoryForTurn(turnInfo, lookup);
-                if (!memory?.summary) return;
-
-                const sourceMessages = (turnInfo.assistant?._sourceIndexes || [])
+            const eligibleTurns = snapshot.turns.filter(turnInfo => turnInfo.messageIndexes[1] < candidateCount);
+            const getRoleLength = (turnInfo, role) => {
+                const sourceMessages = (turnInfo[role]?._sourceIndexes || [])
                     .map(index => chatHistory.value[index])
-                    .filter(message => message?.role === 'assistant');
-                const originalMessages = sourceMessages.length > 0 ? sourceMessages : [turnInfo.assistant];
-                const originalLength = originalMessages.reduce(
-                    (total, message) => total + parseCot(message.content || '').main.length,
+                    .filter(message => message?.role === role);
+                const originalMessages = sourceMessages.length > 0 ? sourceMessages : [turnInfo[role]];
+                return originalMessages.reduce(
+                    (total, message) => total + parseCot(message?.content || '').main.length,
                     0
                 );
+            };
+            const secondaryGroups = new Map();
+            eligibleTurns.forEach(turnInfo => {
+                const memory = findSecondaryClassicMemoryForTurn(turnInfo, lookup);
+                if (!memory) return;
+                if (!secondaryGroups.has(memory.id)) secondaryGroups.set(memory.id, { memory, turns: [] });
+                secondaryGroups.get(memory.id).turns.push(turnInfo);
+            });
+            const secondaryTurnSet = new Set();
+            secondaryGroups.forEach(({ memory, turns }) => {
+                const originalLength = turns.reduce(
+                    (total, turnInfo) => total + getRoleLength(turnInfo, 'user') + getRoleLength(turnInfo, 'assistant'),
+                    0
+                );
+                predictedLength += getClassicSecondaryMemoryMarker(memory).length
+                    + parseCot(memory.summary || '').main.length
+                    - originalLength;
+                turns.forEach(turnInfo => secondaryTurnSet.add(turnInfo.turn));
+            });
+
+            eligibleTurns.forEach(turnInfo => {
+                if (secondaryTurnSet.has(turnInfo.turn)) return;
+                const memory = findClassicMemoryForTurn(turnInfo, lookup);
+                if (!memory?.summary) return;
+                const originalLength = getRoleLength(turnInfo, 'assistant');
                 predictedLength += parseCot(memory.summary).main.length - originalLength;
             });
             return Math.max(0, predictedLength);
@@ -3123,7 +3291,7 @@ const app = createApp({
             if (isAutoImageGenEnabled.value) return text; // 生图开启时保留
             return String(text)
                 .replace(/<image\b[^>]*>[\s\S]*?<\/image>/gi, '')
-                .replace(/image###([\s\S]*?)###/gi, '')
+                .replace(getImageTagRegex(), '')
                 .replace(/[ \t]+\n/g, '\n')
                 .replace(/\n{3,}/g, '\n\n')
                 .trim();
@@ -3168,6 +3336,7 @@ const app = createApp({
                         : (script.replaceString || '');
 
                     if (!regexPattern) return;
+                    const isImageGenScript = (script.name || script.scriptName) === 'NAI画图正则';
 
                     // 解析 /pattern/flags 格式
                     if (regexPattern.startsWith('/') && regexPattern.lastIndexOf('/') > 0) {
@@ -3181,25 +3350,23 @@ const app = createApp({
                     }
 
                     ({ pattern: regexPattern, flags } = cardUtils.normalizeRegexModifiers(regexPattern, flags));
+                    const re = isImageGenScript
+                        ? getImageTagRegex()
+                        : new RegExp(regexPattern, flags);
 
-                    const re = new RegExp(regexPattern, flags);
-
-                    // --- Protection Logic Start ---
-                    // 只有当正则不包含 < 或 > 且不包含 markdown 代码块标记 (```) 时，才启用 HTML/代码块保护
-                    // 如果正则本身就在匹配代码块（如用户提供的 ```json ...```），则不应进行保护
-                    // 增强保护：防止普通正则（通常带g）破坏 iframe 渲染内容（HTML文档、Script/Style块）
+                    // 普通正则保护 HTML/代码；明确匹配标签或代码围栏的规则仍直接执行。
                     if (!/[<>]/.test(regexPattern) && !regexPattern.includes('```')) {
-                        // 匹配 完整的 HTML 文档, Script/Style 块, Markdown 代码块, 行内代码, HTML 标签, 或 <cot> 块
-                        // Updated to support <think> and erroneous <cot>...<cot> closing
-                        result = cardUtils.transformUnprotectedText(
-                            result,
-                            part => part.replace(re, replacement)
-                        );
+                        const wholeMatch = re.exec(result);
+                        re.lastIndex = 0;
+                        const wrapped = wholeMatch?.[0] === result ? result.replace(re, replacement) : null;
+                        re.lastIndex = 0;
+                        // 完整保留原文的整条包裹只执行一次，避免给面板内每段文字重复套壳。
+                        result = wrapped !== null && wrapped.includes(result)
+                            ? wrapped
+                            : cardUtils.transformUnprotectedText(result, part => part.replace(re, replacement));
                     } else {
-                        // 如果正则明确包含 <, > 或 ```，说明用户意图直接操作 HTML 或 Markdown 代码块，因此跳过保护直接替换
                         result = result.replace(re, replacement);
                     }
-                    // --- Protection Logic End ---
 
                 } catch (e) {
                     console.error(`Regex error in script "${script.name || 'Unnamed'}":`, e.message);
@@ -3218,7 +3385,7 @@ const app = createApp({
             marked,
             DOMPurify
         });
-        watch(() => [settings.disableImages, regexScripts.value, user.name], () => {
+        watch(() => [settings.disableImages, settings.styleFilterEnabled, regexScripts.value, user.name], () => {
             clearMessageRenderCaches();
         }, { deep: true });
 
@@ -3265,10 +3432,9 @@ const app = createApp({
 
         const appendAssistantResponseError = (message, errorMessage) => {
             if (!message) return;
-            const safeErrorMessage = escapeXmlText(errorMessage || '生成失败');
-            message.content = [
-                String(message.content || '').trimEnd(),
-                `<div class="response-error-text">-- ${safeErrorMessage} --</div>`
+            message.responseError = [
+                message.responseError,
+                String(errorMessage || '生成失败')
             ].filter(Boolean).join('\n\n');
             message.shouldAnimate = false;
             collapseNativeReasoning(message);
@@ -3279,12 +3445,6 @@ const app = createApp({
         };
 
         // API & Models
-        const getApiEndpoint = (path) => {
-            const baseUrl = String(settings.apiUrl || '').replace(/\/+$/, '');
-            const apiUrl = baseUrl.endsWith('/v1') ? baseUrl : `${baseUrl}/v1`;
-            return `${apiUrl}/${String(path || '').replace(/^\/+/, '')}`;
-        };
-
         const fetchModels = async (isManual = false) => {
             const apiKey = String(settings.apiKey || '').trim();
             if (!apiKey) {
@@ -3293,12 +3453,8 @@ const app = createApp({
             }
             try {
                 if (isManual) showToast('正在获取模型列表...', 'info');
-                const url = getApiEndpoint('models');
-                const response = await fetch(url, {
-                    headers: { 'Authorization': `Bearer ${apiKey}` }
-                });
-                if (!response.ok) throw new Error('Failed to fetch models');
-                const data = await response.json();
+                const url = buildApiEndpoint(settings.apiUrl, 'models');
+                const data = await requestJson({ url, apiKey });
                 availableModels.value = data.data || [];
                 if (isManual) showToast(`成功获取 ${availableModels.value.length} 个模型`, 'success');
             } catch (error) {
@@ -3386,11 +3542,8 @@ const app = createApp({
                 return;
             }
             await checkConnectionStatus(apiStatus, apiLatency, 'API', signal => (
-                fetch(getApiEndpoint('models'), {
-                    headers: { 'Authorization': `Bearer ${settings.apiKey}` },
-                    signal
-                })
-            ));
+                requestJson({ url: buildApiEndpoint(settings.apiUrl, 'models'), apiKey: settings.apiKey, signal })
+            ), () => true);
         };
 
         const checkImageGenStatus = async () => {
@@ -3489,6 +3642,9 @@ const app = createApp({
             chatImageSelectionEpoch++;
             pendingChatImages.value = [];
         };
+        const clearPendingCardInteraction = () => {
+            pendingCardInteraction.value = '';
+        };
         const removePendingChatImage = (id) => {
             pendingChatImages.value = pendingChatImages.value.filter(image => image.id !== id);
         };
@@ -3500,9 +3656,7 @@ const app = createApp({
         });
         const recognizeChatImage = async (image) => {
             try {
-                const result = await requestChatCompletion({
-                    url: getApiEndpoint('chat/completions'),
-                    apiKey: settings.apiKey,
+                const result = await requestTrackedChatCompletion({
                     model: settings.visionModel,
                     temperature: 0.2,
                     stream: false,
@@ -3519,7 +3673,7 @@ const app = createApp({
                             }
                         ]
                     }]
-                });
+                }, 'image_recognition');
                 const target = pendingChatImages.value.find(item => item.id === image.id);
                 if (!target) return true;
                 const description = (Array.isArray(result.content)
@@ -3528,11 +3682,6 @@ const app = createApp({
                 if (!description) throw new Error('识图模型没有返回有效描述');
                 target.description = description;
                 target.status = 'ready';
-                recordApiUsage(result.usage, {
-                    type: 'image_recognition',
-                    model: settings.visionModel,
-                    detail: image.name
-                });
                 return true;
             } catch (error) {
                 const target = pendingChatImages.value.find(item => item.id === image.id);
@@ -3594,35 +3743,44 @@ const app = createApp({
         };
 
         const sendMessage = async () => {
-            if ((!userInput.value.trim() && pendingChatImages.value.length === 0) || isConversationBusy.value || isRecognizingImages.value) return;
+            if ((!userInput.value.trim() && pendingChatImages.value.length === 0 && !pendingCardInteraction.value) || isConversationBusy.value || isRecognizingImages.value) return;
             if (pendingChatImages.value.some(image => image.status !== 'ready')) {
                 showToast('请先移除识别失败的图片', 'warning');
                 return;
             }
 
             const content = userInput.value.trim();
+            const cardInteraction = pendingCardInteraction.value;
             const imageAttachments = pendingChatImages.value.map(({ dataUrl, description }) => ({ dataUrl, description }));
             const startTime = Date.now(); // Record click time
             userInput.value = '';
+            clearPendingCardInteraction();
             clearPendingChatImages();
 
             let finalContent = content;
-            if (sysInstruction.value.trim()) {
-                finalContent += '\n\n[系统指令: ' + sysInstruction.value.trim() + ']';
-                sysInstruction.value = ''; // Auto clear after sending
+            if (cardInteraction) {
+                chatHistory.value.push({
+                    role: 'user',
+                    content: cardInteraction,
+                    isSelf: true,
+                    isTriggered: true,
+                    shouldAnimate: true,
+                    skipReveal: true
+                });
             }
-
-            // Add user message locally with NAME
-            chatHistory.value.push({
-                role: 'user',
-                name: user.name,
-                content: finalContent,
-                shouldAnimate: true,
-                skipReveal: true,
-                isSelf: true,
-                avatar: user.avatar,
-                imageAttachments
-            });
+            if (finalContent || imageAttachments.length) {
+                // Add user message locally with NAME
+                chatHistory.value.push({
+                    role: 'user',
+                    name: user.name,
+                    content: finalContent,
+                    shouldAnimate: true,
+                    skipReveal: true,
+                    isSelf: true,
+                    avatar: user.avatar,
+                    imageAttachments
+                });
+            }
             await nextTick();
 
             // Single player
@@ -3639,6 +3797,7 @@ const app = createApp({
         const clearChat = () => {
             confirmAction('确定要清空聊天记录吗？记忆也将一并清空，此操作无法撤销。', () => {
                 clearPendingChatImages();
+                clearPendingCardInteraction();
                 abortConversationBackgroundWork();
                 resetChatRenderWindow();
                 chatHistory.value = [];
@@ -3710,12 +3869,12 @@ const app = createApp({
                 const messageEl = chatContainer.value?.querySelector(`[data-chat-index="${index}"] .message-content-wrapper`);
                 const messageHeight = messageEl?.getBoundingClientRect?.().height || 0;
                 msg.isEditing_Message = true;
-                const cotMatch = msg.content.match(/<(think|cot)>[\s\S]*?(?:<\/\s*\1\s*>|<\s*\1\s*>|$)/i);
-                const uiTemplateUpdateMatch = msg.content.match(UI_TEMPLATE_UPDATES_PATTERN);
-                msg.originalCot = cotMatch ? cotMatch[0] : '';
-                msg.originalSys = parseCot(msg.content).sys;
+                const cotInfo = parseCot(msg.content);
+                const uiTemplateUpdateMatch = findUiTemplateUpdateBlock(msg.content);
+                msg.originalCot = cotInfo.ranges.map(({ start, end }) => msg.content.slice(start, end)).join('\n\n')
+                    + cotInfo.closingTags;
                 msg.originalUiTemplateUpdate = uiTemplateUpdateMatch ? uiTemplateUpdateMatch[0] : '';
-                msg.originalEditMessageContent = stripUiTemplateUpdateBlock(parseCot(msg.content).main);
+                msg.originalEditMessageContent = stripUiTemplateUpdateBlock(cotInfo.main);
                 msg.editMessageContent = msg.originalEditMessageContent;
                 msg.editMessageHeight = Math.min(0.7 * window.innerHeight, Math.max(88, Math.round(messageHeight || 160)));
             }
@@ -3726,7 +3885,6 @@ const app = createApp({
             delete message.editMessageContent;
             delete message.editMessageHeight;
             delete message.originalCot;
-            delete message.originalSys;
             delete message.originalUiTemplateUpdate;
             delete message.originalEditMessageContent;
         };
@@ -3735,10 +3893,13 @@ const app = createApp({
             const msg = chatHistory.value[index];
             if (msg) {
                 const contentChanged = String(msg.editMessageContent || '') !== String(msg.originalEditMessageContent || '');
-                let finalContent = msg.editMessageContent;
-                if (msg.originalSys) {
-                    finalContent = finalContent + '\n\n[系统指令:\n' + msg.originalSys + ']';
+                if (!contentChanged) {
+                    clearMessageEditState(msg);
+                    await saveChatHistoryNow();
+                    showToast('消息未改动', 'success');
+                    return;
                 }
+                let finalContent = msg.editMessageContent;
                 if (msg.originalUiTemplateUpdate) {
                     finalContent = finalContent.trimEnd() + '\n\n' + msg.originalUiTemplateUpdate;
                 }
@@ -3746,13 +3907,9 @@ const app = createApp({
                     finalContent = msg.originalCot + '\n\n' + finalContent;
                 }
                 msg.content = finalContent;
+                delete msg.styleFilterHits;
+                openStyleFilterMessageKey.value = '';
                 clearMessageEditState(msg);
-                if (!contentChanged) {
-                    await saveChatHistoryNow();
-                    showToast('消息已保存', 'success');
-                    return;
-                }
-
                 abortConversationBackgroundWork();
                 const snapshot = await ensureConversationMessageIds();
                 const affectedTurn = snapshot.turns.find(turnInfo =>
@@ -3858,7 +4015,10 @@ const app = createApp({
                 .map(m => ({
                     role: m.role,
                     name: m.role === 'user' ? user.name : (m.name || currentCharacter.value.name),
-                    content: replaceUserNamePlaceholder(appendMessageImageDescriptions(m, parseCot(m.content || '').main))
+                    content: replaceUserNamePlaceholder(appendMessageImageDescriptions(
+                        m,
+                        parseCot(stripUiTemplateUpdateBlock(m.content || '')).main
+                    ))
                 }));
             const recentMessages = sourceMessages.slice(-normalizedUiTemplateAnalysisDepth);
 
@@ -3867,8 +4027,6 @@ const app = createApp({
                 markUiTemplateStatus('skipped', '未选模型');
                 return false;
             }
-            const url = getApiEndpoint('chat/completions');
-
             try {
                 const updateRun = startUiTemplateUpdateRun();
                 const isCurrentRun = () => isUiTemplateUpdateRunCurrent(updateRun.seq, lockedTargetMessageId);
@@ -3881,22 +4039,12 @@ const app = createApp({
                 const pendingTemplateUpdates = [];
 
                 const normalizeUiTemplateUpdates = (parsed, template) => {
-                    if (Array.isArray(parsed?.updates)) {
-                        return normalizeUiTemplateUpdateList(parsed, [template]);
-                    }
-                    if (Array.isArray(parsed)) {
-                        return [{ variables: parsed, reason: '' }];
-                    }
-                    if (!parsed || typeof parsed !== 'object') return [];
-                    if (Object.prototype.hasOwnProperty.call(parsed, 'variables')) {
-                        return [{ variables: parsed.variables, reason: String(parsed.reason || '').trim() }];
-                    }
-                    return [{ variables: parsed, reason: '' }];
+                    return normalizeUiTemplateUpdateList(parsed, [template]);
                 };
 
                 const applyTemplateUpdates = (template, updates, model) => {
                     updates.forEach(update => {
-                        const result = applyUiTemplateUpdateListToTemplate(template, [update], { model, turn, matchName: false });
+                        const result = applyUiTemplateUpdateListToTemplate(template, [update], { model, turn });
                         if (result.changed) {
                             changedFieldCount += result.fieldCount;
                             hasChanges = true;
@@ -3909,49 +4057,37 @@ const app = createApp({
                     try {
                         const currentVariableJson = JSON.stringify(template.variableState || {}, null, 2);
                         const variableSchemaText = stringifyUiSchema(template.variableSchema).trim();
-                        const response = await fetch(url, {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json',
-                                'Authorization': `Bearer ${settings.apiKey}`
-                            },
-                            body: JSON.stringify({
-                                model,
-                                temperature: 0.2,
-                                stream: false,
-                                messages: [
-                                    {
-                                        role: 'system',
-                                        content: replaceUserNamePlaceholder(BUILTIN_PROMPTS.buildUiTemplateAnalysisSystemPrompt({
-                                            templateId: template.id,
-                                            userInfo: buildUserInfoPrompt(),
-                                            currentVariableJson,
-                                            variableSchemaText,
-                                            userName: user.name
-                                        }))
-                                    },
-                                    {
-                                        role: 'user',
-                                        content: JSON.stringify({
-                                            recentMessages
-                                        }, null, 2)
-                                    }
-                                ]
-                            }),
+                        const result = await requestTrackedChatCompletion({
+                            model, temperature: 0.2, stream: false,
+                            messages: [
+                                {
+                                    role: 'system',
+                                    content: replaceUserNamePlaceholder(BUILTIN_PROMPTS.buildUiTemplateAnalysisSystemPrompt({
+                                        templateId: template.id,
+                                        userInfo: buildUserInfoPrompt(),
+                                        currentVariableJson,
+                                        variableSchemaText,
+                                        userName: user.name
+                                    }))
+                                },
+                                { role: 'user', content: JSON.stringify({ recentMessages }, null, 2) }
+                            ],
                             signal: updateRun.signal
-                        });
+                        }, 'ui_template');
                         if (!isCurrentRun()) return;
-                        if (!response.ok) throw new Error(`API Error: ${response.status}`);
-                        const data = await response.json();
-                        if (!isCurrentRun()) return;
-                        let content = data.choices?.[0]?.message?.content || '';
-                        const parsed = parseUiTemplateUpdateJson(content);
-                        const updates = normalizeUiTemplateUpdates(parsed, template);
-                        recordApiUsage(getApiUsagePayload(data), {
-                            type: 'ui_template',
+                        const content = parseCot(result.content).main;
+                        const latestUiTemplateAnalysis = {
+                            time: new Date().toISOString(),
                             model,
-                            detail: template.name || ''
-                        });
+                            templateId: template.id,
+                            templateName: template.name || template.id,
+                            content: String(content)
+                        };
+                        window.__RPHubLastUiTemplateAnalysis = latestUiTemplateAnalysis;
+                        console.info('[UI模板][副模型] 最新一次变量输出：', latestUiTemplateAnalysis);
+                        const updateBlock = findUiTemplateUpdateBlock(content);
+                        const parsed = parseUiTemplateUpdates(updateBlock ? updateBlock[1] : content, [template]);
+                        const updates = normalizeUiTemplateUpdates(parsed, template);
                         pendingTemplateUpdates.push({ template, updates, model });
                     } catch (e) {
                         if (updateRun.signal.aborted || !isCurrentRun()) return;
@@ -4059,6 +4195,14 @@ const app = createApp({
             if (!Number.isFinite(turn) || turn <= 0) return 0;
             const turnInfo = snapshot?.turns?.find(item => item.turn === turn);
             const assistantIds = new Set(getClassicTurnSourceIds(turnInfo, 'assistant'));
+            classicMemories.value = classicMemories.value.flatMap(memory => {
+                if (!isSecondaryClassicMemory(memory)) return [memory];
+                const range = getClassicMemoryTurnRange(memory);
+                const matchesSource = (memory.sourceAssistantIds || []).some(id => assistantIds.has(id));
+                return matchesSource || (turn >= range.start && turn <= range.end)
+                    ? getSecondaryClassicSourceMemories(memory)
+                    : [memory];
+            });
             return filterClassicMemoriesAsync(memory => {
                 const memoryIds = memory.sourceAssistantIds || [];
                 const matchesSource = memoryIds.some(id => assistantIds.has(id));
@@ -4109,8 +4253,15 @@ const app = createApp({
                 const sourceIds = (memory.sourceAssistantIds || []).length
                     ? memory.sourceAssistantIds
                     : (memory.sourceUserIds || []);
-                const liveTurn = sourceIds.map(id => turnByMessageId.get(id)).find(Number.isFinite);
-                if (Number.isFinite(liveTurn)) memory.turn = liveTurn;
+                const liveTurns = sourceIds.map(id => turnByMessageId.get(id)).filter(Number.isFinite);
+                if (!liveTurns.length) return;
+                if (isSecondaryClassicMemory(memory)) {
+                    memory.turnStart = Math.min(...liveTurns);
+                    memory.turnEnd = Math.max(...liveTurns);
+                    memory.turn = memory.turnEnd;
+                } else {
+                    memory.turn = liveTurns[0];
+                }
             });
         };
 
@@ -4131,30 +4282,19 @@ const app = createApp({
             if (key && memorySettings.emptyTurns?.[key]?.length) memorySettings.emptyTurns[key] = [];
         };
 
-        const removeClassicMemoriesFromTurn = async (snapshot, firstRemovedTurn) => {
-            const liveTurnsByAssistantId = new Map();
-            (snapshot?.turns || []).forEach(turnInfo => {
-                getClassicTurnSourceIds(turnInfo, 'assistant').forEach(id => {
-                    liveTurnsByAssistantId.set(id, turnInfo.turn);
-                });
-            });
-            return filterClassicMemoriesAsync(memory => {
-                const liveTurn = (memory.sourceAssistantIds || [])
-                    .map(id => liveTurnsByAssistantId.get(id))
-                    .find(Number.isFinite);
-                return (liveTurn || Number(memory.turn) || 0) < firstRemovedTurn;
-            });
+        const removeClassicMemoriesFromTurn = (firstRemovedTurn) => {
+            const previousCount = classicMemories.value.length;
+            classicMemories.value = trimClassicMemoriesToTurn(classicMemories.value, firstRemovedTurn - 1);
+            return Math.max(0, previousCount - classicMemories.value.length);
         };
 
         const deleteMessage = (index) => {
             const targetMessage = chatHistory.value[index];
-            if (!targetMessage || !['user', 'assistant', 'system'].includes(targetMessage.role)) return;
+            if (!targetMessage || !canDeleteMessage(index)) return;
             const deletesUserTurn = targetMessage.role === 'user';
             const message = deletesUserTurn
                 ? '确定要删除该轮次吗？该轮的相关项也将一并删除。'
-                : targetMessage.role === 'system'
-                    ? '确定要删除这条状态消息吗？'
-                    : '确定要删除这条 AI 消息吗？该轮的相关项也将一并删除。';
+                : '确定要删除这条 AI 消息吗？该轮的相关项也将一并删除。';
             confirmAction(message, async () => {
                 abortConversationBackgroundWork();
                 const snapshot = await ensureConversationMessageIds();
@@ -4175,25 +4315,19 @@ const app = createApp({
                     .filter(Boolean));
                 recentGenerationTimes.value = recentGenerationTimes.value.filter(t => !removedMessageIds.has(t.id || t));
                 const nextHistory = chatHistory.value.filter((_, messageIndex) => !removedIndexes.has(messageIndex));
-                const nextSnapshot = buildConversationTurnSnapshot(nextHistory, { includeSystem: false });
-                const uiCleanup = removeUiTemplateChangesForTurn(affectedTurn, {
-                    beforeSnapshot: snapshot,
-                    beforeHistory: chatHistory.value,
-                    shiftLaterTurns: nextSnapshot.turns.length < snapshot.turns.length
-                });
-                syncMemoryConversationBindings(snapshot, { backfill: true });
-                // 向量和总结记忆按各自的消息绑定分别清理。
+                const uiCleanup = pruneUiTemplateChangesFromTurn(affectedTurn);
                 if (affectedTurn) {
                     await removeVectorMemoriesForConversationTurn(snapshot, affectedTurn);
                     await removeClassicMemoriesForConversationTurn(snapshot, affectedTurn);
                 }
                 chatHistory.value = nextHistory;
-                syncMemoryConversationBindings(nextSnapshot);
+                restoreSecondaryClassicMemoriesForTurnCount(
+                    buildConversationTurnSnapshot(nextHistory, { includeSystem: false }).turns.length
+                );
                 clearCurrentVectorEmptyTurns();
-                removeOrphanedUiTemplateCorrections();
                 await saveConversationMutationNow({ saveTemplateRuntime: uiCleanup.logs > 0 || uiCleanup.blocks > 0 });
                 await saveMemorySettingsNow();
-                const deletedLabel = deletesUserTurn ? '该轮次' : targetMessage.role === 'system' ? '状态消息' : 'AI 消息';
+                const deletedLabel = deletesUserTurn ? '该轮次' : 'AI 消息';
                 showToast(`${deletedLabel}已删除，相关项已一并清除`, 'success');
             });
         };
@@ -4220,7 +4354,7 @@ const app = createApp({
                 syncMemoryConversationBindings(snapshot, { backfill: true });
                 const currentTurn = snapshot.turns.length;
                 await filterMemoriesAsync(m => (m.turn || 0) < currentTurn);
-                await removeClassicMemoriesFromTurn(snapshot, currentTurn);
+                removeClassicMemoriesFromTurn(currentTurn);
                 clearCurrentVectorEmptyTurns();
                 await Promise.all([saveMemoriesNow(), saveClassicMemoriesNow(), saveMemorySettingsNow()]);
                 await generateResponse(startTime, { reuseGeneratingState: true });
@@ -4235,7 +4369,7 @@ const app = createApp({
                     const turnAtIndex = getConversationTurnAtIndexFromSnapshot(snapshot, index);
                     const uiTurnAtIndex = turnAtIndex;
                     await filterMemoriesAsync(m => (m.turn || 0) < turnAtIndex);
-                    await removeClassicMemoriesFromTurn(snapshot, turnAtIndex);
+                    removeClassicMemoriesFromTurn(turnAtIndex);
                     const uiCleanup = pruneUiTemplateChangesFromTurn(uiTurnAtIndex);
                     // Remove timing record for the message being regenerated
                     if (msg && msg.id) {
@@ -4253,14 +4387,7 @@ const app = createApp({
         };
 
         const getEnabledActiveTools = () => normalizeActiveTools()
-            .filter(tool => tool.enabled !== false && tool.callName)
-            .filter(tool => memorySettings.mode === MEMORY_MODE_VECTOR || !isVectorActiveTool(tool));
-
-        const isVectorActiveTool = (tool) => tool?.type === ACTIVE_TOOL_VECTOR_TYPE
-            || normalizeActiveToolBaseCallName(tool?.callName) === 'tool_memory';
-
-        const isKeywordActiveTool = (tool) => tool?.type === ACTIVE_TOOL_KEYWORD_TYPE
-            || normalizeActiveToolBaseCallName(tool?.callName) === 'tool_grep';
+            .filter(tool => tool.enabled !== false && tool.callName);
 
         const isWebActiveTool = (tool) => tool?.type === ACTIVE_TOOL_WEB_TYPE
             || normalizeActiveToolBaseCallName(tool?.callName) === 'tool_web'
@@ -4269,8 +4396,6 @@ const app = createApp({
 
         const getActiveToolDisplayDescription = (tool) => tool?.displayDescription || '暂无说明';
 
-        const shouldSuppressStandardVectorMemoryRecall = () => false;
-
         const appendActiveToolReminderToLatestUserMessage = (msgArray) => {
             if (getEnabledActiveTools().length === 0) return msgArray;
             const reminder = getActiveToolLatestUserReminder();
@@ -4278,8 +4403,7 @@ const app = createApp({
                 const content = String(message?.content || '');
                 return message?.role === 'user'
                     && content.trim()
-                    && !isRoleMemoryContextContent(content)
-                    && !content.includes('<active_tool_results>');
+                    && !isRoleMemoryContextContent(content);
             });
             if (!latestUserMessage) return msgArray;
 
@@ -4292,35 +4416,43 @@ const app = createApp({
             return msgArray;
         };
 
-        const getActiveToolCallLabels = (tool) => {
-            const baseCallName = normalizeActiveToolBaseCallName(tool?.callName || 'tool_memory');
-            return {
-                add: `${baseCallName}_add`,
-                cover: `${baseCallName}_cover`
-            };
-        };
+        const buildActiveToolDefinitions = (tools) => tools.map(tool => ({
+            type: 'function',
+            function: {
+                name: tool.callName,
+                description: `${tool.description} 每次最多返回 ${tool.resultCount} 条。`,
+                parameters: {
+                    type: 'object',
+                    properties: {
+                        query: { type: 'string', description: isWebActiveTool(tool) ? '具体搜索词，或需要读取的真实网页 URL。' : '前文原文中可能出现的关键词。' },
+                        mode: { type: 'string', enum: ['add', 'cover'], description: '默认 add 保留已有结果；cover 用新结果替换本轮此前所有检索结果。' },
+                        reason: { type: 'string', description: '可选，一句话说明检索用途。' }
+                    },
+                    required: ['query'],
+                    additionalProperties: false
+                }
+            }
+        }));
 
-        const buildActiveToolSystemPrompt = () => {
-            const tools = getEnabledActiveTools();
+        const buildActiveToolSystemPrompt = (tools) => {
             if (tools.length === 0) return '';
             return BUILTIN_PROMPTS.buildActiveToolSystemPrompt({
-                tools: tools.map(tool => {
-                    const labels = getActiveToolCallLabels(tool);
-                    return {
-                        name: tool.name,
-                        description: tool.description,
-                        resultCount: tool.resultCount,
-                        addCallName: labels.add,
-                        coverCallName: labels.cover,
-                        kind: isWebActiveTool(tool) ? 'web' : (isKeywordActiveTool(tool) ? 'keyword' : 'vector')
-                    };
-                }),
+                tools,
                 reminder: getActiveToolLatestUserReminder(),
                 aggressivenessLabel: getActiveToolAggressivenessLabel(),
-                defaultResultCount: ACTIVE_TOOL_DEFAULT_RESULT_COUNT
+                maxRounds: ACTIVE_TOOL_MAX_AUTO_CONTINUE
             });
         };
-        const appendNextResponsePrompt = (messageList, { cotEnabled = false, writingStylePrompt = '' } = {}) => {
+        const usesThinkingCotTag = (model) => /(?:deepseek|glm|kimi)/i.test(String(model || ''));
+        const getMessageThinkingText = (message, includeNativeReasoning = true) => {
+            const parts = includeNativeReasoning ? [String(message?.reasoning || '').trim()] : [];
+            parts.push(parseCot(message?.content || '').rawCot);
+            return [...new Set(parts)].filter(Boolean).join('\n\n');
+        };
+        const wrapAnalysis = (tag, text) => text
+            ? `<${tag}>\n${text.replace(/<\s*\/?\s*(?:thinking|think|cot)\s*>/gi, '')}\n</${tag}>\n`
+            : '';
+        const appendNextResponsePrompt = (messageList, { cotEnabled = false, useThinkingTag = false, writingStylePrompt = '' } = {}) => {
             const target = [...messageList].reverse().find(message => (
                 message?.role === 'user'
                 && Array.isArray(message._sourceIndexes)
@@ -4329,15 +4461,20 @@ const app = createApp({
             if (!target) return;
 
             const prompt = BUILTIN_PROMPTS.buildNextResponsePrompt({
+                autoImageGenEnabled: isAutoImageGenEnabled.value,
                 cotEnabled,
+                imageGenCount: settings.imageGenCount,
+                memoryEnabled: memorySettings.enabled,
+                useThinkingTag,
                 writingStylePrompt,
-                uiTemplateEnabled: settings.uiTemplateEnabled
-                    && settings.uiTemplateMainModelAnalysis
-                    && activeUiTemplates.value.length > 0
+                storyPanelsEnabled: isStoryPanelsEnabled.value,
+                uiTemplateEnabled: isUiTemplateAnalysisEnabled()
             });
-            target.content = `${String(target.content || '').trimEnd()}\n\n${prompt}`;
+            const replyToolReminder = isTruncationEnabled.value
+                ? `(${BUILTIN_PROMPTS.replyToolInstruction.replace(/。$/, '')})` : '';
+            target.content = `${String(target.content || '').trimEnd()}${replyToolReminder}\n\n${prompt}`;
         };
-        let _wasCancelled = false;
+        const usedGeminiPromptNonces = new Set();
         const generateResponse = async (startTime = null, options = {}) => {
             const reuseGeneratingState = options.reuseGeneratingState === true;
             if (isGenerating.value && !reuseGeneratingState) return;
@@ -4345,6 +4482,7 @@ const app = createApp({
             const continueAssistantMessageId = options.continueAssistantMessageId || null;
             const continuationToolCallId = options.continuationToolCallId || null;
             const requestModel = settings.model;
+            const requestTools = activeToolDepth < ACTIVE_TOOL_MAX_AUTO_CONTINUE ? getEnabledActiveTools() : [];
 
             if (!currentCharacter.value) {
                 showToast('请先选择一个角色', 'error');
@@ -4363,8 +4501,9 @@ const app = createApp({
             // 避免底部全局 typing 占位气泡冒出来。
             isReceiving.value = !!continuationTargetMessage;
             isThinking.value = false;
-            activeToolContinuationMessageId.value = continuationTargetMessage?.id || null;
-            activeToolContinuationToolCallId.value = continuationTargetMessage ? continuationToolCallId : null;
+            const isToolContinuation = !!(continuationTargetMessage && continuationToolCallId);
+            activeToolContinuationMessageId.value = isToolContinuation ? continuationTargetMessage.id : null;
+            activeToolContinuationToolCallId.value = isToolContinuation ? continuationToolCallId : null;
             activeToolContinuationHasResponse.value = false;
             abortController.value = new AbortController();
             let generationStartTime = startTime || Date.now();
@@ -4383,7 +4522,10 @@ const app = createApp({
 
             // --- Advanced World Info Processing ---
 
-            const postprocessedChatHistory = getPostprocessedChatMessages(chatHistory.value, { includeSystem: false });
+            // 中途检索的 assistant 已由原生调用消息携带，不能再作为普通聊天重复注入。
+            const postprocessedChatHistory = getPostprocessedChatMessages(chatHistory.value.map(message => (
+                message === continuationTargetMessage ? null : message
+            )), { includeSystem: false });
             const {
                 entries: budgetedEntries,
                 groups: wiGroups,
@@ -4393,7 +4535,16 @@ const app = createApp({
             // Construct Prompt Parts
             const enabledPresets = presets.value
                 .map(normalizePreset)
-                .filter(p => p.enabled && p.content.trim());
+                .filter(p => isPresetEnabled(p) && p.content.trim());
+            const noncePreset = enabledPresets.find(p => p.role === 'system');
+            if (/gemini/i.test(requestModel) && noncePreset) {
+                let nonce;
+                do {
+                    nonce = Math.random().toString(36).slice(2, 8 + Math.floor(Math.random() * 3));
+                } while (!/^(?=.*[a-z])(?=.*\d)[a-z\d]{6,8}$/.test(nonce) || usedGeminiPromptNonces.has(nonce));
+                usedGeminiPromptNonces.add(nonce);
+                noncePreset.content = noncePreset.content.replace(/(\s*<\/[\w:-]+>\s*)?$/, `\n${nonce}$1`);
+            }
             const writingStylePresets = enabledPresets.filter(p => p.name === BUILTIN_PRESETS.writingStyle.name);
             const cotPresets = enabledPresets.filter(p => p.name === 'COT');
             const systemPresets = enabledPresets.filter(p => p.name !== 'COT'
@@ -4449,8 +4600,9 @@ const app = createApp({
             // 6. User Info (Moved to end)
             systemPromptParts.push(userPrompt);
 
-            const activeToolPrompt = buildActiveToolSystemPrompt();
+            const activeToolPrompt = buildActiveToolSystemPrompt(requestTools);
             if (activeToolPrompt) systemPromptParts.push(activeToolPrompt);
+            else if (activeToolDepth > 0) systemPromptParts.push('本轮检索已结束，请依据已有结果完成回复，不再调用检索工具；无法确认的信息明确说明。');
 
             const uiTemplateContextPrompt = buildUiTemplateContextSystemPrompt();
             if (uiTemplateContextPrompt) systemPromptParts.push(uiTemplateContextPrompt);
@@ -4505,16 +4657,40 @@ const app = createApp({
                 chatHistory.value[0].role === 'assistant' &&
                 chatHistory.value[0].content === currentCharacter.value.first_mes;
 
+            const useThinkingTag = usesThinkingCotTag(requestModel);
+            const retainedThinkingTag = useThinkingTag ? 'thinking' : 'cot';
+            const openingText = String(currentCharacter.value.first_mes || '').trim();
+            const openingSourceMessage = openingText
+                ? chatHistory.value.find(source => source?.role === 'assistant'
+                    && parseCot(source.content || '').main.trim() === openingText)
+                : null;
+            const openingThinking = cotPresets.length > 0
+                ? wrapAnalysis(retainedThinkingTag, BUILTIN_PROMPTS.buildOpeningAnalysisContent({
+                    memoryEnabled: memorySettings.enabled,
+                    uiTemplateEnabled: isUiTemplateAnalysisEnabled(),
+                    characterName: currentCharacter.value.name
+                }))
+                : '';
+
             // 如果当前历史记录的第一条是“总结”消息，则认为开场白已被总结包含，不再强制补录开场白
             if (!hasFirstMesInHistory && currentCharacter.value.first_mes) {
                 messages.push({
                     role: 'assistant',
                     name: currentCharacter.value.name,
-                    content: currentCharacter.value.first_mes
+                    content: `${openingThinking}${currentCharacter.value.first_mes}`
                 });
             }
 
-            // 记忆压缩：向量模式移除已覆盖的旧轮次；总结模式只替换旧轮次的 AI 消息。
+            // 记忆压缩：一次总结替换旧 AI 消息；二次总结把对应五轮合成一条。
+            const recentThinkingByMessage = new Map();
+            if (cotPresets.length > 0) {
+                for (let index = chatHistory.value.length - 1; index >= 0 && recentThinkingByMessage.size < 2; index--) {
+                    const source = chatHistory.value[index];
+                    if (source?.role !== 'assistant' || source === openingSourceMessage || source === continuationTargetMessage) continue;
+                    const thinking = getMessageThinkingText(source, useThinkingTag);
+                    if (thinking) recentThinkingByMessage.set(source, thinking);
+                }
+            }
             let chatHistoryForContext = postprocessedChatHistory.map((message, index) => ({
                 ...message,
                 _contextFloor: index + 1
@@ -4572,18 +4748,69 @@ const app = createApp({
                 if (candidateCount > 0) {
                     const lookup = buildClassicMemoryLookup();
                     const contextSnapshot = buildConversationTurnSnapshot(chatHistoryForContext, { alreadyPostprocessed: true });
+                    const secondaryGroups = new Map();
                     contextSnapshot.turns.forEach(turnInfo => {
+                        const assistantIndex = turnInfo.messageIndexes[1];
+                        if (assistantIndex >= candidateCount) return;
+                        const secondaryMemory = findSecondaryClassicMemoryForTurn(turnInfo, lookup);
+                        if (secondaryMemory) {
+                            if (!secondaryGroups.has(secondaryMemory.id)) {
+                                secondaryGroups.set(secondaryMemory.id, { memory: secondaryMemory, turns: [] });
+                            }
+                            secondaryGroups.get(secondaryMemory.id).turns.push(turnInfo);
+                        }
+                    });
+
+                    const secondaryTurnSet = new Set();
+                    const removableIndices = new Set();
+                    secondaryGroups.forEach(({ memory, turns }) => {
+                        const orderedTurns = [...turns].sort((a, b) => a.turn - b.turn);
+                        const retainedIndexes = orderedTurns[orderedTurns.length - 1]?.messageIndexes || [];
+                        const retainedUserIndex = retainedIndexes[0];
+                        const retainedAssistantIndex = retainedIndexes[1];
+                        if (!Number.isFinite(retainedUserIndex) || !Number.isFinite(retainedAssistantIndex)) return;
+                        orderedTurns.forEach(turnInfo => {
+                            secondaryTurnSet.add(turnInfo.turn);
+                            turnInfo.messageIndexes.forEach(messageIndex => {
+                                if (messageIndex !== retainedUserIndex && messageIndex !== retainedAssistantIndex) {
+                                    removableIndices.add(messageIndex);
+                                }
+                            });
+                        });
+                        chatHistoryForContext[retainedUserIndex] = {
+                            ...chatHistoryForContext[retainedUserIndex],
+                            content: getClassicSecondaryMemoryMarker(memory),
+                            _sourceIndexes: [],
+                            _preventContextMerge: true,
+                            _suppressUiTemplateCorrection: true
+                        };
+                        chatHistoryForContext[retainedAssistantIndex] = {
+                            ...chatHistoryForContext[retainedAssistantIndex],
+                            content: memory.summary,
+                            _sourceIndexes: []
+                        };
+                    });
+
+                    contextSnapshot.turns.forEach(turnInfo => {
+                        if (secondaryTurnSet.has(turnInfo.turn)) return;
                         const assistantIndex = turnInfo.messageIndexes[1];
                         if (assistantIndex >= candidateCount) return;
                         const memory = findClassicMemoryForTurn(turnInfo, lookup);
                         if (!memory?.summary) return;
                         suppressedUiTemplateCorrectionIndexes.add(turnInfo.messageIndexes[0]);
+                        chatHistoryForContext[turnInfo.messageIndexes[0]] = {
+                            ...chatHistoryForContext[turnInfo.messageIndexes[0]],
+                            _suppressUiTemplateCorrection: true
+                        };
                         chatHistoryForContext[assistantIndex] = {
                             ...chatHistoryForContext[assistantIndex],
                             content: memory.summary,
                             _sourceIndexes: []
                         };
                     });
+                    if (removableIndices.size > 0) {
+                        chatHistoryForContext = chatHistoryForContext.filter((_, index) => !removableIndices.has(index));
+                    }
                 }
             }
 
@@ -4591,14 +4818,20 @@ const app = createApp({
             messages = messages.concat(chatHistoryForContext
                 .map((m, messageIndex) => {
                     const sourceIndexes = Array.isArray(m._sourceIndexes) ? m._sourceIndexes : [];
-                    const suppressUiTemplateCorrection = suppressedUiTemplateCorrectionIndexes.has(messageIndex);
+                    const suppressUiTemplateCorrection = m._suppressUiTemplateCorrection === true
+                        || suppressedUiTemplateCorrectionIndexes.has(messageIndex);
                     const sourceMessages = sourceIndexes.length > 0
                         ? sourceIndexes.map(sourceIndex => chatHistory.value[sourceIndex]).filter(source => source && source.role === m.role)
                         : [m];
                     const cleanSourceContent = (source) => {
-                        // Remove CoT content from history messages before sending to AI.
+                        // Remove internal thinking/COT from history before sending, then restore only the retained recent blocks.
                         const parsedData = parseCot(source.content || '');
-                        let content = stripDisabledImageGenContext(stripNextResponsePrompt(stripUiTemplateContextInjection(parsedData.main)));
+                        let content = stripUiTemplateContextInjection(parsedData.main);
+                        if (!settings.uiTemplateEnabled || !settings.uiTemplateMainModelAnalysis) content = stripUiTemplateUpdateBlock(content);
+                        content = stripDisabledImageGenContext(stripNextResponsePrompt(content));
+                        const recentThinking = source.role === 'assistant' ? recentThinkingByMessage.get(source) : '';
+                        if (recentThinking) content = `${wrapAnalysis(retainedThinkingTag, recentThinking)}${content}`;
+                        if (source === openingSourceMessage && openingThinking) content = `${openingThinking}${content}`;
                         if (source.role === 'user') content = appendMessageImageDescriptions(source, content);
                         if (settings.uiTemplateEnabled
                             && settings.uiTemplateMainModelAnalysis
@@ -4606,13 +4839,9 @@ const app = createApp({
                             && !suppressUiTemplateCorrection
                             && source.uiTemplateCorrection) {
                             content = `${BUILTIN_PROMPTS.buildMainModelUiTemplateCorrectionPrompt({
-                                failedResult: source.uiTemplateCorrection.result,
+                                failureSummary: source.uiTemplateCorrection.summary,
                                 failureReason: source.uiTemplateCorrection.reason
                             })}\n\n${content.trimStart()}`;
-                        }
-                        const cleanSys = stripDisabledImageGenContext(parsedData.sys || '');
-                        if (cleanSys && source.role === 'user') {
-                            content += '\n\n[系统指令: ' + cleanSys + ']';
                         }
                         return content.trim();
                     };
@@ -4626,7 +4855,8 @@ const app = createApp({
                         name: m.name || (m.role === 'user' ? user.name : currentCharacter.value.name),
                         content: cleanContent,
                         _sourceIndexes: sourceIndexes,
-                        _contextFloor: m._contextFloor
+                        _contextFloor: m._contextFloor,
+                        _preventContextMerge: m._preventContextMerge === true
                     };
                 })
                 .filter(m => String(m.content || '').trim())
@@ -4634,18 +4864,19 @@ const app = createApp({
             appendPendingUiTemplateCorrection(messages);
             appendNextResponsePrompt(messages, {
                 cotEnabled: cotPresets.length > 0,
+                useThinkingTag: usesThinkingCotTag(requestModel),
                 writingStylePrompt: writingStylePresets
                     .map(preset => preset.content
                         .replace(/^\s*<writing_style>\s*/i, '')
                         .replace(/\s*<\/writing_style>\s*$/i, ''))
+                .concat(/deepseek/i.test(requestModel) ? '正文最少700字。' : [])
                     .join('\n\n')
             });
 
             let selectedVectorMemories = [];
             if (memorySettings.enabled
                 && memorySettings.mode === MEMORY_MODE_VECTOR
-                && memories.value.length > 0
-                && !shouldSuppressStandardVectorMemoryRecall()) {
+                && memories.value.length > 0) {
                 selectedVectorMemories = await selectVectorMemoriesForContext(abortController.value.signal, {
                     excludedTurns: getRetainedRecentMemoryTurns(postprocessedChatHistory)
                 });
@@ -4660,18 +4891,10 @@ const app = createApp({
                 messages,
                 worldInfoGroups: wiGroups,
                 vectorMemories: vectorMemoriesForContext,
-                vectorDepth: Number(memorySettings.defaultDepth) || MEMORY_VECTOR_DEFAULT_DEPTH,
+                vectorDepth: MEMORY_VECTOR_DEFAULT_DEPTH,
                 safeTargetLimit
             });
-            messages = appendActiveToolReminderToLatestUserMessage(messages);
-            const activeToolContextPayload = pendingActiveToolContext.value || (activeToolDepth > 0 ? buildActiveToolResultPayload() : '');
-            if (activeToolContextPayload) {
-                messages.push({
-                    role: 'user',
-                    content: activeToolContextPayload
-                });
-                pendingActiveToolContext.value = '';
-            }
+            if (activeToolDepth === 0) messages = appendActiveToolReminderToLatestUserMessage(messages);
             messages = postprocessContextMessages(messages).map((message, index, array) => ({
                 ...message,
                 content: processRegex(message.content || '', {
@@ -4681,6 +4904,8 @@ const app = createApp({
                 })
             }));
 
+            // 必须在正则、角色合并和记忆处理之后追加，保留 tool_call_id 及服务端签名。
+            messages.push(...activeToolMessages);
             const contextViewerState = buildContextViewerState({
                 messages,
                 budgetedEntries,
@@ -4691,19 +4916,28 @@ const app = createApp({
             lastContextMessages.value = contextViewerState.contextMessages;
             lastTriggeredWorldInfos.value = contextViewerState.triggeredWorldInfos;
 
-            const apiMessages = messages.map(({ role, name, content }) => ({
+            const apiMessages = messages.map(({ role, name, content, tool_calls, tool_call_id, reasoning_content, reasoning, reasoning_details, extra_content }) => ({
                 role,
                 name,
-                content
+                content,
+                ...(tool_calls ? { tool_calls } : {}),
+                ...(tool_call_id ? { tool_call_id } : {}),
+                ...(reasoning_content ? { reasoning_content } : {}),
+                ...(reasoning ? { reasoning } : {}),
+                ...(reasoning_details ? { reasoning_details } : {}),
+                ...(extra_content ? { extra_content } : {})
             }));
-
             let generatedAssistantMessageId = null;
             let assistantMessage = null;
             let continuingAssistantMessage = continuationTargetMessage;
             let continuationToolCall = null;
             let continuationContentStarted = false;
             let continuationReasoningStarted = false;
-            let responseUsage = null;
+            let generationFailed = false;
+            let wasCancelled = false;
+            let toolResponse = null;
+            const requestToolUis = new Map();
+            const requestSignal = abortController.value.signal;
 
             if (continuingAssistantMessage && continuationToolCallId && Array.isArray(continuingAssistantMessage.toolCalls)) {
                 continuationToolCall = continuingAssistantMessage.toolCalls.find(call => call && call.id === continuationToolCallId) || null;
@@ -4712,6 +4946,7 @@ const app = createApp({
 
             const prepareAssistantMessageForAppend = (message) => {
                 if (!message) return null;
+                delete message.responseError;
                 if (!message.id) message.id = generateUUID();
                 if (typeof message.content !== 'string') message.content = '';
                 if (typeof message.reasoning !== 'string') message.reasoning = '';
@@ -4729,41 +4964,23 @@ const app = createApp({
                 const startedKey = field === 'reasoning' ? 'continuationReasoningStarted' : 'continuationContentStarted';
                 const hasStarted = field === 'reasoning' ? continuationReasoningStarted : continuationContentStarted;
 
-                if (field === 'content' && message._activeToolCaptureActive) {
-                    message._activeToolPendingText = `${message._activeToolPendingText || ''}${text}`;
-                    promoteActiveToolCallsFromAssistant(message);
-                    if (isContinuation) {
-                        if (!hasStarted) continuationContentStarted = true;
-                        activeToolContinuationHasResponse.value = true;
-                    }
-                    return;
-                }
-
                 const existing = String(message[field] || '');
+                const appendValue = isContinuation && field === 'content' && !hasStarted
+                    ? String(text).replace(/^\s+/, '')
+                    : text;
+                if (!appendValue) return;
 
                 if (isContinuation && !hasStarted && existing.trim()) {
-                    message[field] = existing.replace(/\s+$/, '') + '\n\n' + text;
+                    message[field] = existing.replace(/\s+$/, '') + '\n\n' + appendValue;
                 } else {
-                    message[field] = existing + text;
+                    message[field] = existing + appendValue;
                 }
 
                 if (isContinuation && !hasStarted) {
                     if (startedKey === 'continuationReasoningStarted') continuationReasoningStarted = true;
                     else continuationContentStarted = true;
                 }
-                if (field === 'content') {
-                    promoteActiveToolCallsFromAssistant(message);
-                }
                 if (isContinuation) activeToolContinuationHasResponse.value = true;
-            };
-
-            const appendAssistantReasoning = (message, text) => {
-                if (!message || !text) return;
-                if (continuationToolCall && continuingAssistantMessage && message.id === continuingAssistantMessage.id) {
-                    appendAssistantText(message, 'reasoning', text);
-                    return;
-                }
-                appendAssistantText(message, 'reasoning', text);
             };
 
             const createAssistantMessage = (content = '', reasoning = '') => reactive({
@@ -4783,40 +5000,43 @@ const app = createApp({
                 if (assistantMessage) return assistantMessage;
                 if (continuingAssistantMessage) {
                     assistantMessage = prepareAssistantMessageForAppend(continuingAssistantMessage);
-                    if (reasoning) appendAssistantReasoning(assistantMessage, reasoning);
+                    if (reasoning) appendAssistantText(assistantMessage, 'reasoning', reasoning);
                     if (content) appendAssistantText(assistantMessage, 'content', content);
                     isReceiving.value = true;
                     return assistantMessage;
                 }
 
                 assistantMessage = createAssistantMessage(content, reasoning);
-                promoteActiveToolCallsFromAssistant(assistantMessage);
                 chatHistory.value.push(assistantMessage);
                 isReceiving.value = true;
                 return assistantMessage;
             };
 
             try {
-                const responseResult = await requestChatCompletion({
-                    url: getApiEndpoint('chat/completions'),
-                    apiKey: settings.apiKey,
+                const responseResult = await requestTrackedChatCompletion({
                     model: requestModel,
                     messages: apiMessages,
+                    logResponse: true,
+                    replyInTool: isTruncationEnabled.value,
+                    tools: buildActiveToolDefinitions(requestTools),
+                    requireTool: activeToolDepth === 0 && requestTools.length > 0 && getActiveToolAggressiveness() === 'force',
                     temperature: settings.temperature,
                     reasoningEffort: settings.reasoningEffort,
                     stream: settings.stream,
-                    signal: abortController.value.signal,
-                    onDelta: async ({ content: rawContent, reasoning }) => {
+                    signal: requestSignal,
+                    onDelta: async ({ content: rawContent, reasoning, toolCalls }) => {
                         const content = (!assistantMessage && !String(rawContent).trim()) ? '' : rawContent;
-                        if (!content && !reasoning) return;
+                        if (!content && !reasoning && !toolCalls?.length) return;
 
                         let seededContent = false;
                         let seededReasoning = false;
                         if (!assistantMessage) {
-                            if (reasoning) isThinking.value = true;
                             assistantMessage = ensureAssistantMessage(content, reasoning);
                             seededContent = !!content;
                             seededReasoning = !!reasoning;
+                            if (seededReasoning) {
+                                isThinking.value = true;
+                            }
                             if (seededContent && !reasoning) {
                                 isThinking.value = false;
                                 collapseNativeReasoning(assistantMessage);
@@ -4824,7 +5044,8 @@ const app = createApp({
                             await nextTick();
                         }
                         if (reasoning && !seededReasoning) {
-                            appendAssistantReasoning(assistantMessage, reasoning);
+                            // 原生思考中的文字标签不能改变 API 已指定的通道。
+                            appendAssistantText(assistantMessage, 'reasoning', reasoning);
                             isThinking.value = true;
                         }
                         if (content && !seededContent) {
@@ -4832,105 +5053,116 @@ const app = createApp({
                             isThinking.value = false;
                             collapseNativeReasoning(assistantMessage);
                         }
+                        if (toolCalls?.length) syncNativeActiveToolUis(assistantMessage, toolCalls, requestToolUis, requestTools);
                     }
-                });
-                responseUsage = responseResult.usage || responseUsage;
-
+                }, activeToolDepth > 0 ? 'tool_continuation' : 'chat');
+                if (requestSignal.aborted) throw createAbortReason();
+                if (activeToolDepth > 0 && !responseResult.toolCalls.length && !responseResult.content.trim()) {
+                    throw new Error('检索完成，但 API 未返回正文，请重新尝试。');
+                }
                 if (!responseResult.isStream) {
                     const { content, reasoning } = responseResult;
                     isThinking.value = !!(reasoning && !content);
                     if (content || reasoning) {
                         assistantMessage = ensureAssistantMessage(content, reasoning);
+                        const hasReasoning = !!String(assistantMessage.reasoning || '').trim();
+                        const hasContent = !!String(assistantMessage.content || '').trim();
+                        isThinking.value = hasReasoning && !hasContent;
+                        const hasReasoningAndContent = hasReasoning && hasContent;
                         if (!continuingAssistantMessage) {
-                            assistantMessage.isReasoningOpen = !(reasoning && content);
-                            assistantMessage.isReasoningAutoCollapsed = !!(reasoning && content);
-                        } else if (reasoning && content) {
+                            assistantMessage.isReasoningOpen = !hasReasoningAndContent;
+                            assistantMessage.isReasoningAutoCollapsed = hasReasoningAndContent;
+                        } else if (hasReasoningAndContent) {
                             collapseNativeReasoning(assistantMessage);
                         }
                     }
                 }
-                recordApiUsage(responseUsage, {
-                    type: activeToolDepth > 0 ? 'tool_continuation' : 'chat',
-                    model: requestModel,
-                    detail: activeToolDepth > 0 ? `第 ${activeToolDepth} 次续写` : ''
-                });
+                if (responseResult.toolCalls.length) {
+                    assistantMessage = ensureAssistantMessage();
+                    syncNativeActiveToolUis(assistantMessage, responseResult.toolCalls, requestToolUis, requestTools, true);
+                    toolResponse = responseResult;
+                    activeToolHandoffPending.value = true;
+                }
+                const duration = Date.now() - generationStartTime;
 
                 if (assistantMessage) {
                     generatedAssistantMessageId = assistantMessage.id;
-                    if (settings.uiTemplateEnabled && settings.uiTemplateMainModelAnalysis) {
+                    if (!toolResponse && settings.uiTemplateEnabled && settings.uiTemplateMainModelAnalysis) {
                         applyMainModelUiTemplateUpdates(assistantMessage, requestModel);
                     }
 
-                    const duration = Date.now() - generationStartTime;
                     recentGenerationTimes.value.push({ id: assistantMessage.id, duration });
                     if (recentGenerationTimes.value.length > 5) recentGenerationTimes.value.shift();
                 }
             } catch (error) {
-                if (error.name === 'AbortError') {
-                    _wasCancelled = true;
+                generationFailed = true;
+                for (const toolUi of requestToolUis.values()) {
+                    toolUi.status = 'error';
+                    toolUi.error = error.name === 'AbortError' ? '生成已中止' : (error.message || '工具调用未完整返回');
+                }
+                const cancelled = error.name === 'AbortError';
+                const errorMessage = cancelled ? '生成已中止' : (error.message || '生成失败');
+                const targetMessage = assistantMessage || continuingAssistantMessage;
+                if (cancelled) {
+                    wasCancelled = true;
                     showToast('生成已中止', 'info');
-                    const wasReceiving = isReceiving.value;
                     isGenerating.value = false;
                     isRemoteGenerating.value = false;
                     isThinking.value = false;
-                    const lastMessage = chatHistory.value[chatHistory.value.length - 1];
-                    if (lastMessage && lastMessage.role === 'assistant' && wasReceiving) {
-                        const hasContent = !!(lastMessage.content || '').trim();
-                        const hasReasoning = !!(lastMessage.reasoning || '').trim();
-                        if (hasContent || hasReasoning) {
-                            if (hasContent) {
-                                lastMessage.content += '\n\n*-- 生成已中止 --*';
-                            } else {
-                                lastMessage.content = '*-- 生成已中止 --*';
-                            }
-                            lastMessage.shouldAnimate = false;
-                            collapseNativeReasoning(lastMessage);
-                        } else {
-                            chatHistory.value.pop();
-                            chatHistory.value.push({ role: 'system', name: currentCharacter.value.name, content: '生成已中止', skipReveal: true });
-                        }
-                    } else {
-                        chatHistory.value.push({ role: 'system', name: currentCharacter.value.name, content: '生成已中止', skipReveal: true });
-                    }
-                } else if (continuingAssistantMessage) {
-                    const errorMessage = error.message || '生成失败';
-                    appendAssistantResponseError(continuingAssistantMessage, errorMessage);
-                    activeToolContinuationHasResponse.value = true;
+                }
+                if (targetMessage) {
+                    appendAssistantResponseError(targetMessage, errorMessage);
+                    if (continuingAssistantMessage) activeToolContinuationHasResponse.value = true;
                 } else {
-                    chatHistory.value.push({ role: 'system', name: currentCharacter.value.name, content: error.message });
+                    chatHistory.value.push({ role: 'system', name: currentCharacter.value.name, content: errorMessage, skipReveal: true });
                 }
             } finally {
-                if (assistantMessage?.content) filterBlockedStyleText(assistantMessage.content, { log: true });
+                if (assistantMessage?.content) {
+                    const styleFilterHits = [];
+                    assistantMessage.content = filterBlockedStyleText(assistantMessage.content, {
+                        log: true,
+                        collect: styleFilterHits
+                    });
+                    const previousHits = continuingAssistantMessage && Array.isArray(assistantMessage.styleFilterHits)
+                        ? assistantMessage.styleFilterHits
+                        : [];
+                    const combinedHits = [...previousHits, ...styleFilterHits]
+                        .map(normalizeStyleFilterHit)
+                        .filter(Boolean);
+                    if (combinedHits.length) assistantMessage.styleFilterHits = combinedHits;
+                    else delete assistantMessage.styleFilterHits;
+                }
                 if (continuationToolCall && continuationToolCall.status === 'continuing') {
                     continuationToolCall.status = 'done';
                 }
                 collapseActiveNativeReasoning();
                 await saveChatHistoryNow();
+                isThinking.value = false;
                 isGenerating.value = false;
                 isReceiving.value = false;
-                isThinking.value = false;
                 if (!continueAssistantMessageId || activeToolContinuationMessageId.value === continueAssistantMessageId) {
                     activeToolContinuationMessageId.value = null;
                     activeToolContinuationToolCallId.value = null;
                     activeToolContinuationHasResponse.value = false;
                 }
                 abortController.value = null;
-                const wasCancelled = _wasCancelled;
-                _wasCancelled = false;
                 if (waitTimer) {
                     clearInterval(waitTimer);
                     waitTimer = null;
                 }
 
-                const needsPostGenerationTurns = !wasCancelled
-                    && ((settings.uiTemplateEnabled && generatedAssistantMessageId)
-                        || memorySettings.enabled);
-                const activeToolContinued = !wasCancelled && assistantMessage
-                    ? await handleActiveToolCallFromAssistant(assistantMessage, activeToolDepth)
+                wasCancelled ||= requestSignal.aborted;
+                const activeToolContinued = !wasCancelled && !generationFailed && toolResponse
+                    ? await handleActiveToolCallFromAssistant(assistantMessage, toolResponse, requestToolUis, requestTools, activeToolDepth)
                     : false;
                 if (!activeToolContinued) {
                     resetActiveToolResultContext();
+                    activeToolHandoffPending.value = false;
                 }
+                const needsPostGenerationTurns = !wasCancelled && !generationFailed
+                    && !toolResponse
+                    && ((settings.uiTemplateEnabled && generatedAssistantMessageId)
+                        || memorySettings.enabled);
                 const hasCompletedTurns = !activeToolContinued && needsPostGenerationTurns && buildConversationTurnSnapshot().turns.length > 0;
 
                 if (hasCompletedTurns && settings.uiTemplateEnabled && generatedAssistantMessageId && !settings.uiTemplateMainModelAnalysis) {
@@ -5109,51 +5341,29 @@ const app = createApp({
             };
         };
 
-        const getClassicSummaryResponseContent = (rawText) => {
-            const readContent = (value) => {
-                if (Array.isArray(value)) {
-                    return value.map(item => item?.text || item?.content || '').join('');
-                }
-                return String(value || '');
-            };
-
-            try {
-                const data = JSON.parse(rawText);
-                const apiError = extractApiErrorMessage(data);
-                if (apiError) throw new Error(apiError);
-                return readContent(data.choices?.[0]?.message?.content || data.choices?.[0]?.text);
-            } catch (error) {
-                if (error?.name !== 'SyntaxError') throw error;
-            }
-
-            let content = '';
-            String(rawText || '').split(/\r?\n/).forEach(line => {
-                const trimmed = line.trim();
-                if (!trimmed.startsWith('data:')) return;
-                const payload = trimmed.replace(/^data:\s*/, '');
-                if (!payload || payload === '[DONE]') return;
-                try {
-                    const data = JSON.parse(payload);
-                    const choice = data.choices?.[0];
-                    content += readContent(choice?.delta?.content || choice?.message?.content || choice?.text);
-                } catch (_) { }
-            });
-            return content;
-        };
-
-        const requestClassicMemorySummary = async (job, signal) => {
+        const requestClassicMemoryCompletion = async (requestMessages, signal) => {
             const model = String(memorySettings.classicModel || '').trim();
             if (!settings.apiUrl || !settings.apiKey) throw new Error('请先配置 API 地址和 Key');
             if (!model) throw new Error('请先选择总结模式副模型');
-            const summaryLengthRequirement = SUMMARY_LENGTH_REQUIREMENTS[memorySettings.summaryLevel]
-                || SUMMARY_LENGTH_REQUIREMENTS[SUMMARY_LEVEL_DEFAULT];
 
+            const result = await requestTrackedChatCompletion({
+                model, temperature: 0.2, stream: false, messages: requestMessages, signal
+            }, 'summary');
+            const summary = parseCot(result.content).main
+                .replace(/^```(?:text|markdown)?\s*/i, '')
+                .replace(/\s*```$/, '')
+                .replace(/^(?:最新对话总结|总结)[:：]\s*/i, '')
+                .trim();
+            if (!summary) throw new Error('副模型没有返回有效总结');
+            return summary.replace(/\n{3,}/g, '\n\n');
+        };
+
+        const requestClassicMemorySummary = async (job, signal) => {
             const requestMessages = [{
                 role: 'system',
                 content: BUILTIN_PROMPTS.buildClassicSummarySystemPrompt({
                     userName: user.name,
-                    characterName: currentCharacter.value?.name,
-                    lengthRequirement: summaryLengthRequirement
+                    characterName: currentCharacter.value?.name
                 })
             }];
 
@@ -5168,39 +5378,167 @@ const app = createApp({
                 role: 'user',
                 content: BUILTIN_PROMPTS.buildClassicSummaryFinalInstruction(job.turn)
             });
+            return requestClassicMemoryCompletion(requestMessages, signal);
+        };
 
-            const response = await fetch(getApiEndpoint('chat/completions'), {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${settings.apiKey}`
-                },
-                body: JSON.stringify({
-                    model,
-                    temperature: 0.2,
-                    stream: false,
-                    messages: requestMessages
-                }),
-                signal
-            });
-            const rawText = await response.text();
-            if (!response.ok) {
-                let payload = null;
-                try { payload = JSON.parse(rawText); } catch (_) { }
-                throw new Error(extractApiErrorMessage(payload, response.status) || `API Error: ${response.status}`);
+        const requestClassicSecondarySummary = async (group, signal) => {
+            const ordered = [...group].sort((a, b) => Number(a.turn) - Number(b.turn));
+            const startTurn = Number(ordered[0]?.turn) || 1;
+            const endTurn = Number(ordered[ordered.length - 1]?.turn) || startTurn;
+            const requestMessages = [{
+                role: 'system',
+                content: BUILTIN_PROMPTS.buildClassicSecondarySummaryPrompt({
+                    userName: user.name,
+                    characterName: currentCharacter.value?.name,
+                    startTurn,
+                    endTurn
+                })
+            }, {
+                role: 'user',
+                content: ordered.map(memory => `【第 ${memory.turn} 轮】\n${memory.summary}`).join('\n\n')
+            }];
+            return requestClassicMemoryCompletion(requestMessages, signal);
+        };
+
+        const getSecondaryClassicSourceMemories = (memory) => prepareClassicMemoriesForRuntime(
+            Array.isArray(memory?.sourceMemories) ? memory.sourceMemories : []
+        ).filter(item => !isSecondaryClassicMemory(item));
+
+        const trimClassicMemoriesToTurn = (items, lastTurn) => (Array.isArray(items) ? items : []).flatMap(memory => {
+            if (!isSecondaryClassicMemory(memory)) {
+                return Number(memory?.turn) <= lastTurn ? [memory] : [];
             }
-            const summary = getClassicSummaryResponseContent(rawText)
-                .replace(/^```(?:text|markdown)?\s*/i, '')
-                .replace(/\s*```$/, '')
-                .replace(/^(?:最新对话总结|总结)[:：]\s*/i, '')
-                .trim();
-            if (!summary) throw new Error('副模型没有返回有效总结');
-            recordApiUsage(extractApiUsageFromText(rawText), {
-                type: 'summary',
-                model,
-                detail: `第 ${job.turn} 轮`
+            const range = getClassicMemoryTurnRange(memory);
+            if (range.end <= lastTurn) return [memory];
+            if (range.start > lastTurn) return [];
+            return getSecondaryClassicSourceMemories(memory)
+                .filter(sourceMemory => Number(sourceMemory.turn) <= lastTurn);
+        });
+
+        const getEligibleClassicSecondaryGroups = (totalTurns) => {
+            const compressionLimit = Math.max(0, Number(totalTurns) - CLASSIC_SECONDARY_KEEP_TURNS);
+            if (compressionLimit < CLASSIC_SECONDARY_GROUP_SIZE) return [];
+            const byTurn = new Map();
+            classicMemories.value.forEach(memory => {
+                const turn = Number(memory?.turn);
+                if (!isSecondaryClassicMemory(memory) && turn > 0 && turn <= compressionLimit) byTurn.set(turn, memory);
             });
-            return summary.replace(/\n{3,}/g, '\n\n');
+            const groups = [];
+            for (let start = 1; start + CLASSIC_SECONDARY_GROUP_SIZE - 1 <= compressionLimit; start += CLASSIC_SECONDARY_GROUP_SIZE) {
+                const group = Array.from({ length: CLASSIC_SECONDARY_GROUP_SIZE }, (_, offset) => byTurn.get(start + offset));
+                if (group.every(Boolean)) groups.push(group);
+            }
+            return groups;
+        };
+
+        const compressEligibleClassicMemories = async (totalTurns, signal, interactive = false) => {
+            const groups = getEligibleClassicSecondaryGroups(totalTurns);
+            if (!groups.length) return 0;
+            const characterId = currentCharacter.value?.uuid;
+            const storyScopeId = getCurrentStoryBranchScopeId();
+            const epoch = _classicExtractionEpoch;
+            const concurrency = normalizeClassicMemoryConcurrency(memorySettings.classicConcurrency);
+            let completed = 0;
+            let memorySourceForSave = null;
+            classicBatchExtractProgress.value = { current: 0, total: groups.length };
+            try {
+                for (let offset = 0; offset < groups.length; offset += concurrency) {
+                    if (signal?.aborted || epoch !== _classicExtractionEpoch
+                        || currentCharacter.value?.uuid !== characterId
+                        || getCurrentStoryBranchScopeId() !== storyScopeId) break;
+                    const results = await Promise.all(groups.slice(offset, offset + concurrency).map(async group => {
+                        try {
+                            return { group, summary: await requestClassicSecondarySummary(group, signal) };
+                        } catch (error) {
+                            return { group, error };
+                        } finally {
+                            classicBatchExtractProgress.value.current++;
+                        }
+                    }));
+                    if (signal?.aborted || epoch !== _classicExtractionEpoch
+                        || currentCharacter.value?.uuid !== characterId
+                        || getCurrentStoryBranchScopeId() !== storyScopeId) break;
+                    let failed = false;
+                    for (let result of results) {
+                        if (result.error) {
+                            if (result.error.name === 'AbortError') throw result.error;
+                            if (interactive) {
+                                let retryError = result.error;
+                                const range = `${result.group[0].turn}-${result.group[result.group.length - 1].turn}`;
+                                while (true) {
+                                    const retry = await showVueConfirmModal(
+                                        '总结模式补录遇到错误',
+                                        `第 ${range} 轮二次压缩失败：\n${retryError.message}\n\n是否立即重试？`
+                                    );
+                                    if (!retry) {
+                                        const abortError = new Error('用户取消了重试并中止了二次压缩');
+                                        abortError.name = 'AbortError';
+                                        throw abortError;
+                                    }
+                                    try {
+                                        result = {
+                                            group: result.group,
+                                            summary: await requestClassicSecondarySummary(result.group, signal)
+                                        };
+                                        break;
+                                    } catch (error) {
+                                        if (error.name === 'AbortError') throw error;
+                                        retryError = error;
+                                    }
+                                }
+                            } else {
+                                console.warn('Classic memory secondary compression failed:', result.error);
+                                failed = true;
+                                continue;
+                            }
+                        }
+                        const { group, summary } = result;
+                        const sourceIds = new Set(group.map(memory => memory.id));
+                        if (!group.every(memory => classicMemories.value.some(item => item.id === memory.id))) continue;
+                        const startTurn = Number(group[0].turn);
+                        const endTurn = Number(group[group.length - 1].turn);
+                        const sourceMemories = group.map(memory => cloneForStorage(memory));
+                        const mergedMemory = markRuntimeRaw({
+                            id: generateUUID(),
+                            timestamp: Date.now(),
+                            turn: endTurn,
+                            turnStart: startTurn,
+                            turnEnd: endTurn,
+                            summary,
+                            enabled: true,
+                            classicMemory: true,
+                            secondaryCompressed: true,
+                            summaryModel: String(memorySettings.classicModel || '').trim(),
+                            sourceUserIds: [...new Set(group.flatMap(memory => memory.sourceUserIds || []))],
+                            sourceAssistantIds: [...new Set(group.flatMap(memory => memory.sourceAssistantIds || []))],
+                            sourceMemories
+                        });
+                        classicMemories.value = [
+                            ...classicMemories.value.filter(memory => !sourceIds.has(memory.id)),
+                            mergedMemory
+                        ];
+                        memorySourceForSave = classicMemories.value;
+                        completed++;
+                    }
+                    if (failed) break;
+                }
+            } finally {
+                if (completed > 0) await saveClassicMemoriesNow(storyScopeId, memorySourceForSave);
+            }
+            return completed;
+        };
+
+        const restoreSecondaryClassicMemoriesForTurnCount = (totalTurns) => {
+            const compressionLimit = Math.max(0, Number(totalTurns) - CLASSIC_SECONDARY_KEEP_TURNS);
+            let restored = 0;
+            classicMemories.value = classicMemories.value.flatMap(memory => {
+                if (!isSecondaryClassicMemory(memory) || getClassicMemoryTurnRange(memory).end <= compressionLimit) return [memory];
+                const sourceMemories = getSecondaryClassicSourceMemories(memory);
+                if (!sourceMemories.length) return [memory];
+                restored += sourceMemories.length;
+                return sourceMemories;
+            });
+            return restored;
         };
 
         const retryClassicMemory = async (memory) => {
@@ -5211,8 +5549,31 @@ const app = createApp({
             }
 
             const memoryId = memory.id;
+            const retryCharacterId = currentCharacter.value?.uuid;
+            const retryStoryScopeId = getCurrentStoryBranchScopeId();
             retryingClassicMemoryId.value = memoryId;
             try {
+                if (isSecondaryClassicMemory(memory)) {
+                    const sourceMemories = getSecondaryClassicSourceMemories(memory);
+                    if (sourceMemories.length !== CLASSIC_SECONDARY_GROUP_SIZE) {
+                        showToast('找不到这条二次压缩记忆的原始总结', 'warning');
+                        return;
+                    }
+                    const summary = await requestClassicSecondarySummary(sourceMemories);
+                    if (currentCharacter.value?.uuid !== retryCharacterId
+                        || getCurrentStoryBranchScopeId() !== retryStoryScopeId) return;
+                    const memoryIndex = classicMemories.value.findIndex(item => item.id === memoryId);
+                    if (memoryIndex < 0) return;
+                    classicMemories.value[memoryIndex] = markRuntimeRaw({
+                        ...classicMemories.value[memoryIndex],
+                        summary,
+                        summaryModel: String(memorySettings.classicModel || '').trim()
+                    });
+                    await saveClassicMemoriesNow(retryStoryScopeId, classicMemories.value);
+                    const range = getClassicMemoryTurnRange(memory);
+                    showToast(`第 ${range.start}-${range.end} 轮总结已重新生成`, 'success');
+                    return;
+                }
                 const snapshot = await ensureConversationMessageIds();
                 const sourceAssistantIds = new Set((memory.sourceAssistantIds || []).filter(Boolean));
                 const targetIndex = snapshot.turns.findIndex(turnInfo => {
@@ -5376,27 +5737,17 @@ const app = createApp({
             const normalizedInputs = inputs.map(input => String(input || '').trim());
             if (normalizedInputs.some(input => !input)) throw new Error('嵌入内容不能为空');
 
-            const response = await fetch(getApiEndpoint('embeddings'), {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${settings.apiKey}`
-                },
-                body: JSON.stringify({
-                    model,
-                    input: normalizedInputs.length === 1 ? normalizedInputs[0] : normalizedInputs
-                }),
-                signal
+            const requestStartedAt = Date.now();
+            const apiUrl = settings.apiUrl;
+            const apiKey = settings.apiKey;
+            const data = await requestJson({
+                url: buildApiEndpoint(apiUrl, 'embeddings'), apiKey, signal,
+                body: { model, input: normalizedInputs.length === 1 ? normalizedInputs[0] : normalizedInputs }
             });
-
-            if (!response.ok) {
-                let errorPayload = null;
-                try { errorPayload = await response.json(); } catch (_) { }
-                const apiError = extractApiErrorMessage(errorPayload, response.status);
-                throw new Error(apiError || `Embedding API Error: ${response.status}`);
-            }
-
-            const data = await response.json();
+            recordApiUsage(getApiUsagePayload(data), {
+                type: 'embedding', model, apiUrl, apiKey, isStream: false,
+                durationMs: Date.now() - requestStartedAt, outputCharacters: 0
+            });
             const rows = Array.isArray(data.data) ? [...data.data] : [];
             rows.sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
             const vectors = rows.map(row => normalizeEmbedding(row.embedding));
@@ -5410,11 +5761,6 @@ const app = createApp({
                 throw new Error('嵌入接口返回的数据不完整');
             }
 
-            recordApiUsage(getApiUsagePayload(data), {
-                type: 'embedding',
-                model,
-                detail: `${normalizedInputs.length} 条输入`
-            });
             return vectors;
         };
 
@@ -5597,8 +5943,7 @@ const app = createApp({
         );
 
         const passesMemorySimilarityThreshold = (score) => {
-            const threshold = Number(memorySettings.similarityThreshold) || MEMORY_VECTOR_DEFAULT_SIMILARITY;
-            return score >= threshold / 100;
+            return score >= MEMORY_VECTOR_SIMILARITY_THRESHOLD / 100;
         };
 
         const getRecentUserMemoryQueries = (limit = 3) => {
@@ -5886,27 +6231,6 @@ const app = createApp({
             isVectorMemorySearching.value = false;
         };
 
-        const searchVectorMemoriesForTool = async (query, limit, signal) => {
-            const cleanQuery = trimMemoryText(stripVectorMemoryCode(query), 800);
-            if (!cleanQuery) return [];
-
-            const excludedTurns = getCurrentRetainedVectorMemoryTurns();
-            const vectorMemories = memories.value
-                .filter(isEnabledVectorMemory)
-                .filter(memory => isEmbeddingLike(memory.embedding) && memory.embedding.length > 0)
-                .filter(memory => {
-                    const turn = Number(memory.turn) || 0;
-                    return turn <= 0 || !excludedTurns.has(turn);
-                });
-            if (vectorMemories.length === 0) return [];
-
-            const [queryVector] = await requestMemoryEmbeddings([`工具检索：${cleanQuery}`], signal);
-            const queryTerms = extractVectorQueryTerms(cleanQuery);
-            return (await scoreVectorMemories(vectorMemories, queryVector, queryTerms, signal))
-                .slice(0, Math.max(ACTIVE_TOOL_MIN_RESULT_COUNT, Math.min(ACTIVE_TOOL_MAX_RESULT_COUNT, Number(limit) || ACTIVE_TOOL_DEFAULT_RESULT_COUNT)))
-                .map(toScoredVectorMemory);
-        };
-
         const extractKeywordToolTerms = (query) => {
             const cleanQuery = trimMemoryText(stripVectorMemoryCode(query), 300);
             if (!cleanQuery) return [];
@@ -5957,7 +6281,7 @@ const app = createApp({
                 if (!message || message.role === 'system') return;
                 if (options.excludeMessageId && message.id === options.excludeMessageId) return;
                 const text = getKeywordToolMessageText(message);
-                if (!text || isRoleMemoryContextContent(text) || text.includes('<active_tool_results>')) return;
+                if (!text || isRoleMemoryContextContent(text)) return;
 
                 const lowerText = text.toLowerCase();
                 const matchedTerms = terms.filter((term, termIndex) => lowerText.includes(lowerTerms[termIndex]));
@@ -6148,358 +6472,75 @@ const app = createApp({
         };
 
         const resetActiveToolResultContext = () => {
-            activeToolResultContexts.value = [];
-            pendingActiveToolContext.value = '';
+            activeToolMessages.length = 0;
         };
 
-        const buildActiveToolResultPayload = () => {
-            const blocks = activeToolResultContexts.value.filter(Boolean);
-            if (blocks.length === 0) return '';
-            return [
-                '<active_tool_results>',
-                '  <description>以下是本轮正文工具调用返回的记录，可能包含有效结果、空结果或错误。本段内容由系统插入最后一条用户消息结尾。追加调用会保留并追加旧记录，覆盖调用会替换旧记录；只有包含实际片段、网页等证据的记录才算检索成功。请把有效证据作为参考继续回答，不要复述工具调用标签。</description>',
-                blocks.join('\n\n'),
-                '</active_tool_results>'
-            ].join('\n');
-        };
-
-        const updateActiveToolResultContext = (resultContext, mode = 'add') => {
-            if (!resultContext) {
-                pendingActiveToolContext.value = buildActiveToolResultPayload();
-                return;
+        const appendActiveToolResult = (callId, payload) => {
+            if (payload.mode === 'cover' && payload.status === 'ok') {
+                // 保留调用/结果配对，只清掉被新结果取代的资料，避免产生悬空 tool_call_id。
+                activeToolMessages.forEach(message => {
+                    if (message.role === 'tool') message.content = JSON.stringify({ status: 'superseded', replaced_by: callId });
+                });
             }
-            if (mode === 'cover') {
-                activeToolResultContexts.value = [resultContext];
-            } else {
-                activeToolResultContexts.value = [...activeToolResultContexts.value, resultContext];
-            }
-            pendingActiveToolContext.value = buildActiveToolResultPayload();
+            activeToolMessages.push({ role: 'tool', tool_call_id: callId, content: JSON.stringify(payload) });
         };
 
-        const formatActiveToolNoticeContext = (tool, query, mode = 'add', status = 'empty', message = '') => {
-            const title = escapeXmlAttribute(tool?.name || '工具');
-            const modeValue = mode === 'cover' ? 'cover' : 'add';
-            const labels = getActiveToolCallLabels(tool || createDefaultActiveTool());
-            const callName = escapeXmlAttribute(modeValue === 'cover' ? labels.cover : labels.add);
-            const cleanQuery = trimMemoryText(query, 800);
-            const statusValue = escapeXmlAttribute(status || 'notice');
-            const messageText = escapeXmlText(message || '工具没有返回可用内容。');
-            const bodyTag = status === 'error' ? 'error' : 'description';
-            return [
-                `<active_tool_result name="${title}" call="${callName}" mode="${modeValue}" query="${escapeXmlAttribute(cleanQuery)}" status="${statusValue}">`,
-                `  <${bodyTag}>`,
-                indentXmlText(messageText, 4),
-                `  </${bodyTag}>`,
-                '</active_tool_result>'
-            ].join('\n');
-        };
-
-        const normalizeActiveToolResultContext = (resultContext, tool, query, mode = 'add') => {
-            const text = String(resultContext || '').trim();
-            const hasResultBody = /<(?:description|error|memory_fragment|dialogue_fragment|web_source|web_page|failed_page)\b/i.test(text);
-            if (!text || text === '</active_tool_result>' || !text.includes('<active_tool_result') || !hasResultBody) {
-                return formatActiveToolNoticeContext(
-                    tool,
-                    query,
-                    mode,
-                    'empty',
-                    '工具调用已经完成，但没有返回可用内容。请先判断当前上下文是否足够；如果仍不够，请换更具体的检索内容继续调用工具。'
-                );
-            }
-            return text;
-        };
-
-        const formatActiveToolErrorContext = (tool, query, err, mode = 'add') => {
-            const message = err?.message || String(err || '') || '工具调用失败';
-            return formatActiveToolNoticeContext(
-                tool,
-                query,
-                mode,
-                'error',
-                `工具调用出错：${message}\n这不是用户要求的最终答案。请不要停止生成；先基于当前上下文和已有工具结果继续回答。若信息仍不足，可以换更具体的检索内容再次调用工具。`
-            );
-        };
-
-        const formatWebResultItems = (items, tagName, getExtraAttributes = () => []) => items.map(item => {
-            const attributes = [
-                `index="${escapeXmlAttribute(item.index || '')}"`,
-                `title="${escapeXmlAttribute(item.title || '')}"`,
-                `url="${escapeXmlAttribute(item.url || '')}"`,
-                ...getExtraAttributes(item)
-            ];
-            const contentText = indentXmlText(item.content || '', 4);
-            return [
-                `  <${tagName} ${attributes.join(' ')}>`,
-                contentText ? `    <content>\n${contentText}\n    </content>` : '',
-                `  </${tagName}>`
-            ].filter(Boolean).join('\n');
-        }).join('\n\n');
-
-        const formatActiveToolResultContext = (tool, query, results, mode = 'add') => {
-            const title = escapeXmlAttribute(tool.name || '工具');
-            const modeValue = mode === 'cover' ? 'cover' : 'add';
-            const labels = getActiveToolCallLabels(tool);
-            const callName = escapeXmlAttribute(modeValue === 'cover' ? labels.cover : labels.add);
-            const cleanQuery = trimMemoryText(query, 800);
-            const modeDescription = modeValue === 'cover'
-                ? '本次调用模式为覆盖：系统会用本次结果替换本轮此前已检索的工具结果。'
-                : '本次调用模式为追加：系统会把本次结果追加到本轮此前已检索的工具结果后。';
-            if (isWebActiveTool(tool)) {
-                const responseTime = results?.tavilyResponseTime
-                    ? ` response_time="${escapeXmlAttribute(results.tavilyResponseTime)}"`
-                    : '';
-                const webMode = results?.tavilyMode === 'extract' ? 'extract' : 'search';
-
-                if (!Array.isArray(results) || results.length === 0) {
-                    const emptyDescription = webMode === 'extract'
-                        ? `本次网页读取没有检索成功，没有抽取到可用正文，也没有提供可作为答案依据的新证据。${modeDescription}本段内容已插入最后一条用户消息结尾。请先判断当前搜索摘要和上下文是否已经足够；如果仍不够，请换另一个更可靠的来源链接或重新搜索，不要编造网页正文没有支持的信息。`
-                        : `本次联网搜索没有检索成功，没有找到可用网页结果，也没有提供可作为答案依据的新证据。${modeDescription}本段内容已插入最后一条用户消息结尾。请先判断当前上下文是否已经足够；如果仍不够，请换更具体的作品名、角色名、站点名、别名或语言关键词再次调用，不要编造搜索结果没有支持的信息。`;
-                    return [
-                        `<active_tool_result name="${title}" call="${callName}" mode="${modeValue}" query="${escapeXmlAttribute(cleanQuery)}" status="empty" web_mode="${webMode}"${responseTime}>`,
-                        `  <description>${emptyDescription}</description>`,
-                        '</active_tool_result>'
-                    ].join('\n');
+        const parseNativeActiveToolCall = (call, tools) => {
+            const tool = tools.find(item => item.callName === call.function.name);
+            const parsed = { tool, callLabel: call.function.name, query: '', reason: '', mode: 'add', raw: call.function.arguments };
+            try {
+                if (!tool) throw new Error('该工具未开启或不存在');
+                const args = JSON.parse(call.function.arguments);
+                if (!args || typeof args !== 'object' || Array.isArray(args)
+                    || Object.keys(args).some(key => !['query', 'mode', 'reason'].includes(key))
+                    || typeof args.query !== 'string' || !args.query.trim()
+                    || (args.mode !== undefined && !['add', 'cover'].includes(args.mode))
+                    || (args.reason !== undefined && typeof args.reason !== 'string')) {
+                    throw new Error('工具参数应为包含非空 query 字符串的 JSON 对象；mode 只能是 add 或 cover，reason 为可选字符串');
                 }
-
-                if (webMode === 'extract') {
-                    const formattedPages = formatWebResultItems(results, 'web_page');
-
-                    const failedPages = (Array.isArray(results.tavilyFailedResults) ? results.tavilyFailedResults : [])
-                        .filter(item => item.url || item.error)
-                        .map(item => `  <failed_page url="${escapeXmlAttribute(item.url || '')}" error="${escapeXmlAttribute(item.error || '网页读取失败')}"></failed_page>`)
-                        .join('\n');
-
-                    return [
-                        `<active_tool_result name="${title}" call="${callName}" mode="${modeValue}" query="${escapeXmlAttribute(cleanQuery)}" web_mode="extract"${responseTime}>`,
-                        `  <description>以下是系统进入网页链接后通过 Tavily Extract 读取到的网页正文。${modeDescription}本段内容由系统插入最后一条用户消息结尾。请优先依据网页正文继续回答；不要把正文没有支持的内容说成事实。如果正文仍不足以确认，请回到搜索结果选择另一个可靠来源链接，或换更具体的关键词继续搜索。</description>`,
-                        formattedPages,
-                        failedPages,
-                        '</active_tool_result>'
-                    ].filter(Boolean).join('\n');
-                }
-
-                const formattedResults = formatWebResultItems(results, 'web_source', item => [
-                    Number.isFinite(item.score) ? `score="${escapeXmlAttribute(item.score.toFixed(4))}"` : '',
-                    item.publishedDate ? `published_date="${escapeXmlAttribute(item.publishedDate)}"` : ''
-                ].filter(Boolean));
-
-                return [
-                    `<active_tool_result name="${title}" call="${callName}" mode="${modeValue}" query="${escapeXmlAttribute(cleanQuery)}" web_mode="search"${responseTime}>`,
-                    `  <description>以下是系统通过 Tavily 联网搜索得到的网页资料。${modeDescription}本段内容由系统插入最后一条用户消息结尾。请优先依据这些标题、链接和摘要继续回答；不要把搜索结果没有支持的内容说成事实。如果摘要仍不足以明确回答，请从结果中选择一个或多个最相关的真实 URL，追加调用 <${callName}:该URL> 进入网页读取正文，或换更具体的关键词继续搜索。可以多行调用多个 URL，系统会按顺序追加结果。</description>`,
-                    formattedResults,
-                    '</active_tool_result>'
-                ].filter(Boolean).join('\n');
+                Object.assign(parsed, { query: args.query.trim(), reason: (args.reason || '').trim(), mode: args.mode || 'add' });
+            } catch (error) {
+                parsed.error = error instanceof SyntaxError ? '工具参数不是完整有效的 JSON 对象' : error.message;
             }
-            if (isKeywordActiveTool(tool)) {
-                if (!Array.isArray(results) || results.length === 0) {
-                    return [
-                        `<active_tool_result name="${title}" call="${callName}" mode="${modeValue}" query="${escapeXmlAttribute(cleanQuery)}" status="empty">`,
-                        `  <description>本次关键词检索没有检索成功，没有找到包含该关键词的对话片段，也没有提供可作为答案依据的新证据。${modeDescription}本段内容已插入最后一条用户消息结尾。请换更贴近原文的关键词再次调用，不要编造未出现过的对话内容。</description>`,
-                        '</active_tool_result>'
-                    ].join('\n');
-                }
-
-                const formattedResults = results.map(item => {
-                    const turnValue = escapeXmlAttribute(item.turn || '?');
-                    const roleValue = escapeXmlAttribute(item.role || 'unknown');
-                    const speakerValue = escapeXmlAttribute(item.speaker || '');
-                    const matchedValue = escapeXmlAttribute((item.matchedTerms || []).join(', '));
-                    const fragmentText = indentXmlText(item.dialogueText || '', 4);
-                    return [
-                        `  <dialogue_fragment turn="${turnValue}" role="${roleValue}" speaker="${speakerValue}" matched="${matchedValue}">`,
-                        fragmentText,
-                        '  </dialogue_fragment>'
-                    ].join('\n');
-                }).join('\n\n');
-
-                return [
-                    `<active_tool_result name="${title}" call="${callName}" mode="${modeValue}" query="${escapeXmlAttribute(cleanQuery)}">`,
-                    `  <description>以下是系统根据关键词从当前对话历史中精确抓取到的原文片段。${modeDescription}本段内容由系统插入最后一条用户消息结尾。请优先依据这些原文片段继续回答，不要把没有出现过的内容说成事实；如果仍不足以明确回答，请换更贴近原文的关键词继续调用工具。</description>`,
-                    formattedResults,
-                    '</active_tool_result>'
-                ].join('\n');
-            }
-            if (!Array.isArray(results) || results.length === 0) {
-                return [
-                    `<active_tool_result name="${title}" call="${callName}" mode="${modeValue}" query="${escapeXmlAttribute(cleanQuery)}" status="empty">`,
-                    `  <description>本次向量记忆没有检索成功，没有找到可用记忆片段，也没有提供可作为答案依据的新证据。${modeDescription}本段内容已插入最后一条用户消息结尾。请先判断当前上下文是否已经明确且足够；如果仍不够明确完整，请换更具体的检索内容再次调用，不要重复完全相同的查询。</description>`,
-                    '</active_tool_result>'
-                ].join('\n');
-            }
-
-            const formattedResults = sortVectorMemoriesByTime(results).map(memory => {
-                const turnValue = escapeXmlAttribute(memory.turn || '?');
-                const scoreValue = escapeXmlAttribute(Number.isFinite(memory.vectorScore)
-                    ? `${(memory.vectorScore * 100).toFixed(1)}%`
-                    : 'unknown');
-                const storyTimeValue = escapeXmlAttribute(memory.storyTime || '');
-                const fragmentText = indentXmlText(memory.paragraph || memory.summary || memory.sourceText || '', 4);
-                return [
-                    `  <memory_fragment turn="${turnValue}" similarity="${scoreValue}" story_time="${storyTimeValue}">`,
-                    fragmentText,
-                    '  </memory_fragment>'
-                ].join('\n');
-            }).join('\n\n');
-
-            return [
-                `<active_tool_result name="${title}" call="${callName}" mode="${modeValue}" query="${escapeXmlAttribute(cleanQuery)}">`,
-                `  <description>以下是系统根据上一条正文工具调用检索到的向量记忆。${modeDescription}本段内容由系统插入最后一条用户消息结尾。请用这些结果继续回答用户，不要复述工具调用标签，也不要把这些内容当作当前现场；如果结果仍不足以明确回答，或仍有疑点，请换更具体的检索内容继续调用工具。</description>`,
-                formattedResults,
-                '</active_tool_result>'
-            ].join('\n');
+            return parsed;
         };
 
-        const stripCodeBlocksForToolDetection = (text) => String(text || '')
-            .replace(/```[\s\S]*?```/g, '')
-            .replace(/~~~[\s\S]*?~~~/g, '');
-
-        const escapeRegexText = (value) => String(value || '').replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
-
-        const cleanActiveToolCallReason = (value) => String(value || '')
-            .replace(/<\/\s*reason\s*>?\s*$/i, '')
-            .trim();
-
-        const getActiveToolCallReasonMeta = (content, callIndex) => {
-            const beforeCall = String(content || '').slice(0, Math.max(0, callIndex));
-            const match = beforeCall.match(/<\s*reason\s*[:：]\s*([\s\S]*?)(?:>\s*|<\/\s*reason\s*>?\s*)$/i)
-                || beforeCall.match(/<\s*reason\s*>\s*([\s\S]*?)<\/\s*reason\s*>\s*$/i);
-            const reason = cleanActiveToolCallReason(match?.[1]);
-            if (!match || !reason) return { reason: '', rawPrefix: '', mainIndex: callIndex };
-            return {
-                reason,
-                rawPrefix: match[0],
-                mainIndex: callIndex - match[0].length
-            };
-        };
-
-        const buildActiveToolCallMeta = (originalContent, mainContent, toolRaw, callIndex) => {
-            const reasonMeta = getActiveToolCallReasonMeta(mainContent, callIndex);
-            const raw = `${reasonMeta.rawPrefix}${toolRaw}`;
-            const originalIndex = originalContent.indexOf(raw, Math.max(0, reasonMeta.mainIndex));
-            const toolIndex = originalContent.indexOf(toolRaw, callIndex);
-            return {
-                reason: reasonMeta.reason,
-                raw: originalIndex >= 0 ? raw : toolRaw,
-                toolRaw,
-                index: originalIndex >= 0 ? originalIndex : (toolIndex >= 0 ? toolIndex : callIndex),
-                mainIndex: reasonMeta.mainIndex
-            };
-        };
-
-        const findActiveToolCallsInText = (text) => {
-            const originalContent = String(text || '');
-            if (!originalContent) return [];
-            const mainContent = stripCodeBlocksForToolDetection(parseCot(originalContent).main);
-            const tools = getEnabledActiveTools();
-            const calls = [];
-            const seen = new Set();
-
-            for (const tool of tools) {
-                const labels = getActiveToolCallLabels(tool);
-                const callForms = [
-                    { label: labels.add, mode: 'add' },
-                    { label: labels.cover, mode: 'cover' }
-                ];
-                for (const form of callForms) {
-                    const escapedName = escapeRegexText(form.label);
-                    const regex = new RegExp(`<\\s*${escapedName}\\s*:\\s*([\\s\\S]{1,30000}?)\\s*>`, 'gi');
-                    let match;
-                    while ((match = regex.exec(mainContent)) !== null) {
-                        const query = String(match[1] || '').trim();
-                        if (!query) continue;
-
-                        const meta = buildActiveToolCallMeta(originalContent, mainContent, match[0], match.index);
-                        const raw = meta.raw;
-                        const index = meta.index;
-                        const key = `${index}:${match.index}:${form.label}:${raw}`;
-                        if (seen.has(key)) continue;
-                        seen.add(key);
-
-                        calls.push({
-                            tool,
-                            mode: form.mode,
-                            callLabel: form.label,
-                            query,
-                            raw,
-                            toolRaw: meta.toolRaw,
-                            reason: meta.reason,
-                            index,
-                            mainIndex: meta.mainIndex
-                        });
-                    }
+        const syncNativeActiveToolUis = (message, calls, requestUis, tools, complete = false) => {
+            if (!Array.isArray(message.toolCalls)) message.toolCalls = [];
+            calls.forEach((call, position) => {
+                const key = call.index ?? position;
+                const parsed = parseNativeActiveToolCall(call, tools);
+                let ui = requestUis.get(key);
+                if (!ui) {
+                    ui = reactive(createActiveToolUi(parsed, 'receiving'));
+                    requestUis.set(key, ui);
+                    message.toolCalls.push(ui);
                 }
-            }
-
-            return calls.sort((a, b) => {
-                const indexDiff = (a.index ?? 0) - (b.index ?? 0);
-                if (indexDiff !== 0) return indexDiff;
-                return (a.mainIndex ?? 0) - (b.mainIndex ?? 0);
+                Object.assign(ui, {
+                    toolId: parsed.tool?.id || '',
+                    toolType: parsed.tool?.type || '',
+                    name: parsed.tool?.name || call.function.name || '工具调用',
+                    callName: call.function.name,
+                    baseCallName: call.function.name,
+                    query: parsed.query || (complete ? '无有效查询' : '正在接收工具参数…'),
+                    raw: parsed.raw,
+                    reason: parsed.reason,
+                    mode: parsed.mode,
+                    status: complete ? 'queued' : 'receiving'
+                });
             });
         };
 
-        const getActiveToolDetectionText = (message) => [
-            String(message?.content || ''),
-            String(message?._activeToolPendingText || '')
-        ].filter(Boolean).join('\n');
-
-        const findActiveToolCallsInAssistantMessage = (message) => findActiveToolCallsInText(getActiveToolDetectionText(message));
-
-        const findPendingActiveToolCallInText = (text) => {
-            const originalContent = String(text || '');
-            if (!originalContent) return null;
-            const mainContent = stripCodeBlocksForToolDetection(parseCot(originalContent).main);
-            const tools = getEnabledActiveTools();
-            const candidates = [];
-
-            for (const tool of tools) {
-                const labels = getActiveToolCallLabels(tool);
-                [
-                    { label: labels.add, mode: 'add' },
-                    { label: labels.cover, mode: 'cover' }
-                ].forEach(form => {
-                    const escapedName = escapeRegexText(form.label);
-                    const regex = new RegExp(`<\\s*${escapedName}\\s*:\\s*([\\s\\S]*)$`, 'i');
-                    const match = mainContent.match(regex);
-                    if (!match) return;
-
-                    const meta = buildActiveToolCallMeta(originalContent, mainContent, match[0], mainContent.length - match[0].length);
-                    const raw = meta.raw;
-                    candidates.push({
-                        tool,
-                        mode: form.mode,
-                        callLabel: form.label,
-                        query: String(match[1] || '').trim(),
-                        raw,
-                        toolRaw: meta.toolRaw,
-                        reason: meta.reason,
-                        index: meta.index,
-                        mainIndex: meta.mainIndex,
-                        pending: true
-                    });
-                });
-            }
-
-            return candidates.sort((a, b) => {
-                const indexDiff = (a.index ?? 0) - (b.index ?? 0);
-                if (indexDiff !== 0) return indexDiff;
-                return (a.mainIndex ?? 0) - (b.mainIndex ?? 0);
-            })[0] || null;
-        };
-
-        const getPendingToolCallQueryPreview = (toolCall) => {
-            const query = String(toolCall?.query || '').trim();
-            if (!query) return '正在接收工具参数...';
-            return trimMemoryText(query, 160);
-        };
+        const cleanActiveToolCallReason = (value) => String(value || '').trim();
 
         const createActiveToolUi = (toolCall, initialStatus = 'queued') => ({
             id: generateUUID(),
             toolId: toolCall.tool?.id || '',
-            toolType: toolCall.tool?.type || ACTIVE_TOOL_VECTOR_TYPE,
+            toolType: toolCall.tool?.type || '',
             toolResultCount: toolCall.tool?.resultCount || ACTIVE_TOOL_DEFAULT_RESULT_COUNT,
-            name: toolCall.tool?.name || '向量记忆主动检索',
-            callName: toolCall.callLabel || toolCall.tool?.callName || 'tool_memory_add',
-            baseCallName: toolCall.tool?.callName || 'tool_memory',
+            name: toolCall.tool?.name || '工具调用',
+            callName: toolCall.callLabel || toolCall.tool?.callName || '',
+            baseCallName: toolCall.tool?.callName || toolCall.callLabel || '',
             mode: toolCall.mode || 'add',
             query: toolCall.query || '',
             raw: toolCall.raw,
@@ -6519,24 +6560,20 @@ const app = createApp({
                 || toolCall?.callName
                 || ''
             );
-            if (toolCall?.toolType === ACTIVE_TOOL_KEYWORD_TYPE || baseCallName === 'tool_grep') {
-                return ACTIVE_TOOL_KEYWORD_TYPE;
-            }
             if (toolCall?.toolType === ACTIVE_TOOL_WEB_TYPE || baseCallName === 'tool_web') {
                 return ACTIVE_TOOL_WEB_TYPE;
             }
-            if (toolCall?.toolType === ACTIVE_TOOL_VECTOR_TYPE || baseCallName === 'tool_memory') {
-                return ACTIVE_TOOL_VECTOR_TYPE;
+            if (toolCall?.toolType === ACTIVE_TOOL_KEYWORD_TYPE || baseCallName === 'tool_grep') {
+                return ACTIVE_TOOL_KEYWORD_TYPE;
             }
-            return baseCallName || toolCall?.toolId || ACTIVE_TOOL_VECTOR_TYPE;
+            return '';
         };
 
         const getToolCallDisplayName = (toolCall) => {
             const groupKey = getActiveToolUiGroupKey(toolCall);
-            if (groupKey === ACTIVE_TOOL_KEYWORD_TYPE) return '关键词检索';
             if (groupKey === ACTIVE_TOOL_WEB_TYPE) return 'Tavily 联网搜索';
-            if (groupKey === ACTIVE_TOOL_VECTOR_TYPE) return '向量记忆主动检索';
-            return toolCall?.name || '向量记忆主动检索';
+            if (groupKey === ACTIVE_TOOL_KEYWORD_TYPE) return '关键词检索';
+            return toolCall?.name || '工具调用';
         };
 
         const getToolCallModeText = (toolCall) => {
@@ -6553,8 +6590,7 @@ const app = createApp({
             if (groupKey === ACTIVE_TOOL_KEYWORD_TYPE) {
                 return mode === 'cover' ? '覆盖关键词检索' : '关键词检索';
             }
-
-            return mode === 'cover' ? '覆盖向量检索' : '向量检索';
+            return '工具调用';
         };
 
         const TOOL_CALL_RUNNING_STATUSES = ['running', 'receiving', 'queued'];
@@ -6703,390 +6739,81 @@ const app = createApp({
             return steps;
         };
 
-        const stripActiveToolCallsFromAssistant = (message, toolCalls) => {
-            if (!message || !Array.isArray(toolCalls) || toolCalls.length === 0) return;
-            const originalContent = String(message.content || '');
-            const firstToolCallIndex = toolCalls
-                .map(toolCall => Number.isFinite(toolCall.index) ? toolCall.index : originalContent.indexOf(toolCall.raw))
-                .filter(index => index >= 0)
-                .sort((a, b) => a - b)[0];
-            const nextContent = (Number.isFinite(firstToolCallIndex)
-                ? originalContent.slice(0, firstToolCallIndex)
-                : toolCalls.reduce((content, toolCall) => content.replace(toolCall.raw, ''), originalContent))
-                .replace(/\n{3,}/g, '\n\n')
-                .trim();
-
-            message.content = nextContent;
-            message.skipReveal = true;
-        };
-
-        const appendActiveToolCallsToAssistant = (message, toolCalls) => {
-            if (!message || !Array.isArray(toolCalls) || toolCalls.length === 0) return [];
-            if (!Array.isArray(message.toolCalls)) message.toolCalls = [];
-
-            const toolUis = [];
-            toolCalls.forEach((toolCall, index) => {
-                const pendingUiId = message._activeToolPendingUiId;
-                const pendingIndex = index === 0 && pendingUiId
-                    ? message.toolCalls.findIndex(item => item?.id === pendingUiId && item.status === 'receiving')
-                    : -1;
-                const nextUi = createActiveToolUi(toolCall);
-                if (pendingIndex >= 0) {
-                    const previousUi = message.toolCalls[pendingIndex];
-                    nextUi.id = previousUi.id;
-                    nextUi.isOpen = previousUi.isOpen;
-                    nextUi.reason = nextUi.reason || previousUi.reason || '';
-                    nextUi.reasoning = previousUi.reasoning || nextUi.reasoning;
-                    nextUi.isReasoningOpen = previousUi.isReasoningOpen;
-                    message.toolCalls.splice(pendingIndex, 1, nextUi);
-                    delete message._activeToolPendingUiId;
-                } else {
-                    message.toolCalls.push(nextUi);
-                }
-                toolUis.push(nextUi);
-            });
-            message.skipReveal = true;
-            return toolUis;
-        };
-
-        const upsertPendingActiveToolCallToAssistant = (message, toolCall) => {
-            if (!message || !toolCall) return null;
-            if (!Array.isArray(message.toolCalls)) message.toolCalls = [];
-            let toolUi = message._activeToolPendingUiId
-                ? message.toolCalls.find(item => item?.id === message._activeToolPendingUiId && item.status === 'receiving')
-                : null;
-            if (!toolUi) {
-                toolUi = createActiveToolUi(toolCall, 'receiving');
-                message.toolCalls.push(toolUi);
-                message._activeToolPendingUiId = toolUi.id;
-            }
-            toolUi.toolId = toolCall.tool?.id || toolUi.toolId || '';
-            toolUi.toolType = toolCall.tool?.type || toolUi.toolType || ACTIVE_TOOL_VECTOR_TYPE;
-            toolUi.name = toolCall.tool?.name || toolUi.name || '工具';
-            toolUi.callName = toolCall.callLabel || toolUi.callName || 'tool_memory_add';
-            toolUi.baseCallName = toolCall.tool?.callName || toolUi.baseCallName || 'tool_memory';
-            toolUi.mode = toolCall.mode || toolUi.mode || 'add';
-            toolUi.query = getPendingToolCallQueryPreview(toolCall);
-            toolUi.reason = cleanActiveToolCallReason(toolCall.reason || toolUi.reason || '');
-            toolUi.raw = toolCall.raw || toolUi.raw || '';
-            toolUi.status = 'receiving';
-            message.skipReveal = true;
-            return toolUi;
-        };
-
-        const attachActiveToolCallsToAssistant = (message, toolCalls, options = {}) => {
-            const toolUis = appendActiveToolCallsToAssistant(message, toolCalls, options);
-            if (toolUis.length === 0) return [];
-            stripActiveToolCallsFromAssistant(message, toolCalls);
-            return toolUis;
-        };
-
-        const removeActiveToolCallRawsFromText = (text, toolCalls) => {
-            let nextText = String(text || '');
-            [...toolCalls]
-                .sort((a, b) => (b.index ?? b.mainIndex ?? 0) - (a.index ?? a.mainIndex ?? 0))
-                .forEach(toolCall => {
-                    const index = Number.isFinite(toolCall.index) ? toolCall.index : nextText.indexOf(toolCall.raw);
-                    if (index < 0) return;
-                    nextText = `${nextText.slice(0, index)}${nextText.slice(index + String(toolCall.raw || '').length)}`;
-                });
-            return nextText;
-        };
-
-        const promoteActiveToolCallsFromAssistant = (message, options = {}) => {
-            if (!message || typeof message.content !== 'string') return [];
-            const scanText = message._activeToolCaptureActive
-                ? String(message._activeToolPendingText || '')
-                : String(message.content || '');
-            const detectedCalls = findActiveToolCallsInText(scanText);
-            if (detectedCalls.length === 0) {
-                const pendingCall = findPendingActiveToolCallInText(scanText);
-                if (!pendingCall) return [];
-
-                let toolBuffer = scanText;
-                if (!message._activeToolCaptureActive) {
-                    const firstIndex = Math.max(0, pendingCall.index ?? pendingCall.mainIndex ?? scanText.indexOf(pendingCall.raw));
-                    message.content = scanText.slice(0, firstIndex)
-                        .replace(/\n{3,}/g, '\n\n')
-                        .trim();
-                    toolBuffer = scanText.slice(firstIndex);
-                    message._activeToolCaptureActive = true;
-                }
-                upsertPendingActiveToolCallToAssistant(message, {
-                    ...pendingCall,
-                    raw: toolBuffer,
-                    query: String(pendingCall.toolRaw || toolBuffer || '').replace(new RegExp(`^\\s*<\\s*${escapeRegexText(pendingCall.callLabel)}\\s*:\\s*`, 'i'), '')
-                });
-                message._activeToolPendingText = toolBuffer;
-                message.skipReveal = true;
-                activeToolHandoffPending.value = true;
-                return [];
-            }
-
-            let toolBuffer = scanText;
-            let callsForUi = detectedCalls;
-            if (!message._activeToolCaptureActive) {
-                const firstIndex = Math.max(0, detectedCalls[0].index ?? detectedCalls[0].mainIndex ?? scanText.indexOf(detectedCalls[0].raw));
-                message.content = scanText.slice(0, firstIndex)
-                    .replace(/\n{3,}/g, '\n\n')
-                    .trim();
-                message.skipReveal = true;
-                toolBuffer = scanText.slice(firstIndex);
-                callsForUi = findActiveToolCallsInText(toolBuffer);
-                message._activeToolCaptureActive = true;
-            }
-
-            const toolUis = appendActiveToolCallsToAssistant(message, callsForUi, options);
-            if (toolUis.length > 0) {
-                activeToolHandoffPending.value = true;
-            }
-            message._activeToolPendingText = removeActiveToolCallRawsFromText(toolBuffer, callsForUi);
-            return toolUis;
-        };
-
-        const cleanupActiveToolCaptureState = (message) => {
-            if (!message) return;
-            delete message._activeToolCaptureActive;
-            delete message._activeToolPendingText;
-            delete message._activeToolPendingUiId;
-        };
-
-        const resolveActiveToolForUi = (toolUi) => {
-            const baseCallName = normalizeActiveToolBaseCallName(
-                toolUi?.baseCallName
-                || toolUi?.callName
-                || 'tool_memory'
-            );
-            const enabledMatch = getEnabledActiveTools().find(tool => (
-                tool.id === toolUi?.toolId
-                || normalizeActiveToolBaseCallName(tool.callName) === baseCallName
-            ));
-            if (enabledMatch) return enabledMatch;
-            return getDefaultActiveToolDefinitions().find(tool => (
-                tool.id === toolUi?.toolId
-                || normalizeActiveToolBaseCallName(tool.callName) === baseCallName
-            )) || createDefaultActiveTool();
-        };
-
-        const buildActiveToolCallFromUi = (toolUi) => {
-            const tool = resolveActiveToolForUi(toolUi);
-            return {
-                tool,
-                mode: toolUi?.mode || 'add',
-                callLabel: toolUi?.callName || getActiveToolCallLabels(tool).add,
-                query: String(toolUi?.query || '').trim(),
-                raw: toolUi?.raw || '',
-                reason: cleanActiveToolCallReason(toolUi?.reason)
-            };
-        };
-
-        const handleActiveToolCallFromAssistant = async (assistantMessage, activeToolDepth = 0) => {
-            promoteActiveToolCallsFromAssistant(assistantMessage);
-            let toolUis = Array.isArray(assistantMessage?.toolCalls)
-                ? assistantMessage.toolCalls.filter(toolCall => ['queued', 'running'].includes(toolCall?.status))
-                : [];
-            let toolCalls = toolUis.map(buildActiveToolCallFromUi).filter(toolCall => toolCall.query);
-
-            if (toolCalls.length === 0) {
-                toolCalls = findActiveToolCallsInAssistantMessage(assistantMessage);
-            }
-            if (toolCalls.length === 0) {
-                const receivingToolUis = Array.isArray(assistantMessage?.toolCalls)
-                    ? assistantMessage.toolCalls.filter(toolCall => toolCall?.status === 'receiving')
-                    : [];
-                if (receivingToolUis.length > 0) {
-                    receivingToolUis.forEach(toolUi => {
-                        toolUi.status = 'error';
-                        toolUi.error = '工具调用没有完整输出，请重试。';
-                        toolUi.resultText = toolUi.error;
-                    });
-                    await saveChatHistoryNow();
-                }
-                cleanupActiveToolCaptureState(assistantMessage);
-                activeToolHandoffPending.value = false;
-                return false;
-            }
-
-            if (activeToolDepth >= ACTIVE_TOOL_MAX_AUTO_CONTINUE) {
-                if (toolUis.length === 0) {
-                    stripActiveToolCallsFromAssistant(assistantMessage, toolCalls);
-                } else {
-                    toolUis.forEach(toolUi => {
-                        toolUi.status = 'error';
-                    });
-                }
-                cleanupActiveToolCaptureState(assistantMessage);
-                activeToolHandoffPending.value = false;
-                await saveChatHistoryNow();
-                return false;
-            }
-
-            if (toolUis.length === 0) {
-                toolUis = attachActiveToolCallsToAssistant(assistantMessage, toolCalls);
-            }
-            if (toolUis.length === 0) {
-                cleanupActiveToolCaptureState(assistantMessage);
-                activeToolHandoffPending.value = false;
-                return false;
-            }
-            await saveChatHistoryNow();
-
+        const handleActiveToolCallFromAssistant = async (assistantMessage, response, requestUis, requestTools, activeToolDepth) => {
             const toolAbort = new AbortController();
+            activeToolQueueAbortController = toolAbort;
             activeToolQueueRunning.value = true;
             activeToolHandoffPending.value = false;
-            activeToolQueueAbortController = toolAbort;
-            let continuationToolUi = null;
-            let hasToolResult = false;
-
-            const applyActiveToolSuccessRecord = (record) => {
-                if (!record?.ok) return;
-                updateActiveToolResultContext(record.resultContext, record.toolCall.mode);
-                continuationToolUi = record.toolUi;
-                hasToolResult = true;
-            };
-
-            const runActiveToolCallSafely = async (toolCall, toolUi, options = {}) => {
-                try {
-                    if (toolAbort.signal.aborted) throw createAbortReason('Generation cancelled by user');
-                    if (options.markRunning !== false) {
-                        toolUi.status = 'running';
-                        await saveChatHistoryNow();
-                    }
-
-                    if (isVectorActiveTool(toolCall.tool) && !memorySettings.enabled) {
-                        throw new Error('记忆系统未开启，无法执行向量检索。');
-                    }
-
-                    const results = isKeywordActiveTool(toolCall.tool)
-                        ? searchDialogueByKeywordForTool(toolCall.query, toolCall.tool.resultCount, {
-                            excludeMessageId: assistantMessage.id
-                        })
-                        : isWebActiveTool(toolCall.tool)
-                        ? await searchWebByTavilyForTool(
-                            toolCall.query,
-                            toolCall.tool,
-                            toolAbort.signal
-                        )
-                        : await searchVectorMemoriesForTool(
-                            toolCall.query,
-                            toolCall.tool.resultCount,
-                            toolAbort.signal
-                        );
-                    if (toolAbort.signal.aborted) throw createAbortReason('Generation cancelled by user');
-
-                    const resultContext = normalizeActiveToolResultContext(
-                        formatActiveToolResultContext(toolCall.tool, toolCall.query, results, toolCall.mode),
-                        toolCall.tool,
-                        toolCall.query,
-                        toolCall.mode
-                    );
-                    toolUi.status = 'done';
-                    toolUi.resultCount = Array.isArray(results) ? results.length : 0;
-                    toolUi.resultText = resultContext;
-                    await saveChatHistoryNow();
-                    return {
-                        ok: true,
-                        toolCall,
-                        toolUi,
-                        resultContext
-                    };
-                } catch (err) {
-                    if (err.name === 'AbortError') {
-                        return { aborted: true, toolCall, toolUi };
-                    }
-                    const resultContext = formatActiveToolErrorContext(toolCall.tool, toolCall.query, err, toolCall.mode);
-                    toolUi.status = 'error';
-                    toolUi.error = err.message || '工具检索失败';
-                    toolUi.resultCount = 0;
-                    toolUi.resultText = resultContext;
-                    await saveChatHistoryNow();
-                    return { ok: true, toolCall, toolUi, resultContext, error: err };
-                }
-            };
-
-            const flushWebToolBatch = async (webBatch) => {
-                if (!webBatch.length) return;
-                webBatch.forEach(({ toolUi }) => {
-                    toolUi.status = 'running';
-                });
-                await saveChatHistoryNow();
-
-                const records = await Promise.all(webBatch.map(({ toolCall, toolUi }) => (
-                    runActiveToolCallSafely(toolCall, toolUi, { markRunning: false })
-                )));
-                if (records.some(record => record?.aborted)) {
-                    throw createAbortReason('Generation cancelled by user');
-                }
-                records.forEach(applyActiveToolSuccessRecord);
-                webBatch.length = 0;
-            };
-
+            const toolUis = [...requestUis.values()];
             try {
-                const webBatch = [];
-                for (let index = 0; index < toolCalls.length; index += 1) {
-                    const toolCall = toolCalls[index];
-                    const toolUi = toolUis[index];
-                    if (isWebActiveTool(toolCall.tool)) {
-                        webBatch.push({ toolCall, toolUi });
-                        continue;
+                if (activeToolDepth >= ACTIVE_TOOL_MAX_AUTO_CONTINUE) throw new Error('已达到本轮检索次数上限');
+                activeToolMessages.push(response.assistantMessage);
+                // 即使接口一次返回多个调用，也逐一配对结果；并发查询，按原始调用顺序应用 add/cover。
+                const records = await Promise.all(response.toolCalls.map(async (call, position) => {
+                    const toolUi = requestUis.get(call.index ?? position);
+                    const toolCall = parseNativeActiveToolCall(call, requestTools);
+                    let payload;
+                    try {
+                        if (toolAbort.signal.aborted) throw createAbortReason();
+                        if (position >= 5) throw new Error('单次最多执行 5 项检索，请缩小查询范围');
+                        if (toolCall.error) throw new Error(toolCall.error);
+                        if (!getEnabledActiveTools().some(tool => tool.callName === call.function.name)) throw new Error('该工具已关闭');
+                        toolUi.status = 'running';
+                        const results = isWebActiveTool(toolCall.tool)
+                            ? await searchWebByTavilyForTool(toolCall.query, toolCall.tool, toolAbort.signal)
+                            : searchDialogueByKeywordForTool(toolCall.query, toolCall.tool.resultCount, { excludeMessageId: assistantMessage.id });
+                        if (toolAbort.signal.aborted) throw createAbortReason();
+                        payload = {
+                            status: results.length ? 'ok' : 'empty',
+                            query: toolCall.query,
+                            mode: toolCall.mode,
+                            results,
+                            ...(results.tavilyMode ? { operation: results.tavilyMode } : {}),
+                            ...(results.tavilyFailedResults?.length ? { failed_sources: results.tavilyFailedResults } : {})
+                        };
+                        toolUi.status = 'done';
+                        toolUi.resultCount = results.length;
+                    } catch (error) {
+                        if (error.name === 'AbortError') throw error;
+                        payload = { status: 'error', query: toolCall.query, mode: toolCall.mode, error: error.message || '工具检索失败' };
+                        toolUi.status = 'error';
+                        toolUi.error = payload.error;
                     }
-
-                    await flushWebToolBatch(webBatch);
-                    const record = await runActiveToolCallSafely(toolCall, toolUi);
-                    if (record?.aborted) {
-                        markActiveToolInlineWorkCancelled();
-                        await saveChatHistoryNow();
-                        return false;
-                    }
-                    applyActiveToolSuccessRecord(record);
-                }
-                await flushWebToolBatch(webBatch);
-
-                if (!hasToolResult || !continuationToolUi) return false;
-                if (toolAbort.signal.aborted) {
-                    markActiveToolInlineWorkCancelled();
-                    await saveChatHistoryNow();
-                    return false;
-                }
-
-                if (continuationToolUi.status !== 'error') {
-                    continuationToolUi.status = 'continuing';
-                }
-                cleanupActiveToolCaptureState(assistantMessage);
+                    toolUi.resultText = JSON.stringify(payload, null, 2);
+                    console.info('[检索工具]', { 工具: call.function.name, 状态: payload.status, 条数: toolUi.resultCount, ...(payload.error ? { 错误: payload.error } : {}) });
+                    return { callId: call.id, payload };
+                }));
+                if (toolAbort.signal.aborted) throw createAbortReason();
+                records.forEach(record => appendActiveToolResult(record.callId, record.payload));
+                const continuationToolUi = toolUis[toolUis.length - 1];
+                if (continuationToolUi.status !== 'error') continuationToolUi.status = 'continuing';
                 activeToolQueueRunning.value = false;
                 activeToolContinuationPending.value = true;
                 await saveChatHistoryNow();
+                if (toolAbort.signal.aborted) throw createAbortReason();
                 await generateResponse(Date.now(), {
                     activeToolDepth: activeToolDepth + 1,
                     continueAssistantMessageId: assistantMessage.id,
                     continuationToolCallId: continuationToolUi.id
                 });
-                if (continuationToolUi.status === 'continuing') {
-                    continuationToolUi.status = 'done';
-                }
-                await saveChatHistoryNow();
+                if (continuationToolUi.status === 'continuing') continuationToolUi.status = 'done';
                 return true;
-            } catch (err) {
-                if (err.name === 'AbortError') {
+            } catch (error) {
+                if (error.name === 'AbortError') {
                     markActiveToolInlineWorkCancelled();
-                    await saveChatHistoryNow();
-                    return false;
-                }
-                if (assistantMessage) {
-                    const errorMessage = err.message || '生成失败';
-                    appendAssistantResponseError(assistantMessage, errorMessage);
-                    activeToolContinuationHasResponse.value = true;
-                    await saveChatHistoryNow();
+                } else {
+                    toolUis.filter(ui => TOOL_CALL_RUNNING_STATUSES.includes(ui.status)).forEach(ui => {
+                        ui.status = 'error';
+                        ui.error = error.message || '工具处理失败';
+                    });
+                    appendAssistantResponseError(assistantMessage, error.message || '工具处理失败');
                 }
                 return false;
             } finally {
-                if (activeToolQueueAbortController === toolAbort) {
-                    activeToolQueueAbortController = null;
-                }
+                if (activeToolQueueAbortController === toolAbort) activeToolQueueAbortController = null;
                 activeToolHandoffPending.value = false;
                 activeToolQueueRunning.value = false;
                 activeToolContinuationPending.value = false;
-                cleanupActiveToolCaptureState(assistantMessage);
                 await saveChatHistoryNow();
             }
         };
@@ -7213,12 +6940,13 @@ const app = createApp({
             isClassicBatchExtracting.value = true;
             classicBatchExtractProgress.value = { current: 0, total: 0 };
             let totalAdded = 0;
+            let secondaryCompressedCount = 0;
             let foundJobs = false;
 
             try {
                 while (_classicBatchExtractAbort === batchController && !batchController.signal.aborted) {
                     _classicBatchRescanRequested = false;
-            const snapshot = await ensureConversationMessageIds();
+                    const snapshot = await ensureConversationMessageIds();
                     if (_classicBatchExtractAbort !== batchController || batchController.signal.aborted) return;
                     const safeTurnCount = isConversationBusy.value
                         ? Math.max(0, snapshot.turns.length - 1)
@@ -7284,12 +7012,35 @@ const app = createApp({
                     }
                     const currentTurnCount = buildConversationTurnSnapshot(chatHistory.value, { includeSystem: false }).turns.length;
                     if (jobs.length > 0 || _classicBatchRescanRequested || currentTurnCount !== safeTurnCount) continue;
+                    if (getEligibleClassicSecondaryGroups(currentTurnCount).length > 0) {
+                        foundJobs = true;
+                        secondaryCompressedCount += await compressEligibleClassicMemories(
+                            currentTurnCount,
+                            batchController.signal,
+                            manual
+                        );
+                    }
+                    if (_classicBatchExtractAbort !== batchController || batchController.signal.aborted) break;
+                    if (isConversationBusy.value) {
+                        await waitForMemoryConversationIdle(batchController.signal);
+                        continue;
+                    }
+                    const finalTurnCount = buildConversationTurnSnapshot(
+                        chatHistory.value,
+                        { includeSystem: false }
+                    ).turns.length;
+                    if (_classicBatchRescanRequested || finalTurnCount !== currentTurnCount) continue;
                     break;
                 }
 
                 if (_classicBatchExtractAbort === batchController) {
                     if (foundJobs) {
-                        if (manual) showToast(`总结模式补录完成：新增 ${totalAdded} 条记忆`, 'success');
+                        if (manual) {
+                            const results = [];
+                            if (totalAdded > 0) results.push(`新增 ${totalAdded} 条记忆`);
+                            if (secondaryCompressedCount > 0) results.push(`二次压缩 ${secondaryCompressedCount} 组`);
+                            showToast(`总结模式补录完成${results.length ? `：${results.join('，')}` : ''}`, 'success');
+                        }
                     } else {
                         if (manual) showNoMemoryNeededModal.value = true;
                     }
@@ -7723,10 +7474,10 @@ const app = createApp({
             const targetArtists = cardUtils.getImageStyleArtists(settings.imageStyle, settings.customImageArtists);
 
             const encodedTargetArtists = encodeURIComponent(targetArtists);
-            const imageRequestUrl = `${baseUrl}/generate?tag=$1&token=${encodeURIComponent(imageGenToken)}&model=nai-diffusion-4-5-full&artist=${encodedTargetArtists}&size=${settings.imageSize}&steps=40&scale=6&cfg=0&sampler=k_dpmpp_2m_sde&negative={{{{bad anatomy}}}},{bad feet},bad hands,{{{bad proportions}}},{blurry},cloned face,cropped,{{{deformed}}},{{{disfigured}}},error,{{{extra arms}}},{extra digit},{{{extra legs}}},extra limbs,{{extra limbs}},{fewer digits},{{{fused fingers}}},gross proportions,ink eyes,ink hair,jpeg artifacts,{{{{long neck}}}},low quality,{malformed limbs},{{missing arms}},{missing fingers}},{{missing legs}},{{{more than 2 nipples}}},mutated hands,{{{mutation}}},normal quality,owres,{{poorly drawn face}},{{poorly drawn hands}},reen eyes,signature,text,{{too many fingers}},{{{ugly}}},username,uta,watermark,worst quality,{{{more than 2 legs}}},awkward hand sign,weird hand gesture,contorted hand,unnatural finger pose,deformed hand gesture,{shaka},{hang loose},{{rock on}},{shaka sign}&nocache=0&noise_schedule=karras`;
+            const imageRequestUrl = `${baseUrl}/generate?tag=$1&token=${encodeURIComponent(imageGenToken)}&model=${settings.imageModel}&artist=${encodedTargetArtists}&size=${settings.imageSize}&steps=40&scale=6&cfg=0&sampler=k_dpmpp_2m_sde&negative={{{{bad anatomy}}}},{bad feet},bad hands,{{{bad proportions}}},{blurry},cloned face,cropped,{{{deformed}}},{{{disfigured}}},error,{{{extra arms}}},{extra digit},{{{extra legs}}},extra limbs,{{extra limbs}},{fewer digits},{{{fused fingers}}},gross proportions,ink eyes,ink hair,jpeg artifacts,{{{{long neck}}}},low quality,{malformed limbs},{{missing arms}},{missing fingers}},{{missing legs}},{{{more than 2 nipples}}},mutated hands,{{{mutation}}},normal quality,owres,{{poorly drawn face}},{{poorly drawn hands}},reen eyes,signature,text,{{too many fingers}},{{{ugly}}},username,uta,watermark,worst quality,{{{more than 2 legs}}},awkward hand sign,weird hand gesture,contorted hand,unnatural finger pose,deformed hand gesture,{shaka},{hang loose},{{rock on}},{shaka sign}&nocache=0&noise_schedule=karras`;
             const imageGenRegexContent = {
                 name: imageGenRegexName,
-                regex: '/image###([\\s\\S]*?)###/g',
+                regex: getImageTagRegex().toString(),
             replacement: `<div class="generated-image-card is-generating" data-image-request="${imageRequestUrl}" style="width:100%;height:auto;max-width:100%;box-sizing:border-box;padding:2px;border:1px solid rgba(255,255,255,.58);background:transparent;position:relative;border-radius:12px;overflow:hidden;display:flex;justify-content:center;align-items:center;box-shadow:0 4px 14px rgba(148,163,184,.06)"><img alt="" style="max-width:100%;height:100%;width:100%;display:block;object-fit:contain;border-radius:9px;transition:transform .3s ease"><div class="generated-image-progress" aria-live="polite"><svg class="generated-image-spinner" viewBox="0 0 50 50" aria-hidden="true"><circle class="generated-image-spinner-path" cx="25" cy="25" r="20" fill="none" stroke-width="2"></circle></svg><span class="generated-image-progress-label">等待生成</span><span class="generated-image-progress-track"><i class="generated-image-progress-bar"></i></span></div><button type="button" class="generated-image-reroll" title="重新生成图片" aria-label="重新生成图片"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg></button></div>`,
                 placement: [2],
                 markdownOnly: true,
@@ -7748,7 +7499,7 @@ const app = createApp({
 
             // 2. 自动生图世界书
             const autoImageGenWIName = '自动生图';
-            const imageGenCount = Math.min(6, Math.max(1, Number(settings.imageGenCount) || 2));
+            const imageGenCount = Math.min(8, Math.max(2, Number(settings.imageGenCount) || 2));
             const autoImageGenWIContent = {
                 comment: autoImageGenWIName,
                 keys: [],
@@ -7795,6 +7546,14 @@ const app = createApp({
                 }
                 if (msg.role === 'assistant' && msg.isSummaryOpen === undefined && hasThinkingOrTools(msg)) {
                     msg.isSummaryOpen = false;
+                }
+                if (msg.role === 'assistant' && Array.isArray(msg.styleFilterHits)) {
+                    msg.styleFilterHits = msg.styleFilterHits
+                        .map(normalizeStyleFilterHit)
+                        .filter(Boolean);
+                    if (!msg.styleFilterHits.length) delete msg.styleFilterHits;
+                } else {
+                    delete msg.styleFilterHits;
                 }
                 return msg;
             });
@@ -7988,55 +7747,46 @@ const app = createApp({
                 showToast('请选择需要删除的分支，主线不能删除', 'warning');
                 return;
             }
-            const childrenByParent = new Map();
-            storyBranches.value.forEach(branch => {
-                if (!childrenByParent.has(branch.parentId)) childrenByParent.set(branch.parentId, []);
-                childrenByParent.get(branch.parentId).push(branch.id);
-            });
-            const deleteIds = new Set();
-            const stack = [target.id];
-            while (stack.length > 0) {
-                const branchId = stack.pop();
-                if (deleteIds.has(branchId)) continue;
-                deleteIds.add(branchId);
-                stack.push(...(childrenByParent.get(branchId) || []));
-            }
-            const childCount = deleteIds.size - 1;
-            const childHint = childCount > 0 ? `及其 ${childCount} 条子分支` : '';
+            const parentId = storyBranches.value.some(branch => branch.id === target.parentId)
+                ? target.parentId
+                : STORY_BRANCH_MAIN_ID;
+            const parent = storyBranches.value.find(branch => branch.id === parentId);
+            const hasChildren = storyBranches.value.some(branch => branch.parentId === target.id);
             confirmAction(
-                `确定要删除“${target.name}”${childHint}吗？相关聊天、记忆和 UI 状态也会删除，此操作无法撤销。`,
+                `确定要删除“${target.name}”吗？${hasChildren ? `下级分支会顺延到“${parent?.name || '主线'}”下，` : ''}该分支的聊天、记忆和 UI 状态会被删除，此操作无法撤销。`,
                 async () => {
                     try {
-                        if (deleteIds.has(activeStoryBranchId.value)) {
-                            await switchStoryBranch(STORY_BRANCH_MAIN_ID, { closeModal: false, notify: false });
-                            if (activeStoryBranchId.value !== STORY_BRANCH_MAIN_ID) {
-                                throw new Error('无法切换到主线');
+                        if (target.id === activeStoryBranchId.value) {
+                            await switchStoryBranch(parentId, { closeModal: false, notify: false });
+                            if (activeStoryBranchId.value !== parentId) {
+                                throw new Error(`无法切换到“${parent?.name || '主线'}”`);
                             }
                         }
                         storyBranchSwitching.value = true;
                         if (!getMainDb()) await initDB();
-                        const scopeIds = [...deleteIds].map(branchId => getStoryBranchScopeId(char.uuid, branchId));
-                        await Promise.all(scopeIds.flatMap(scopeId => [
+                        const scopeId = getStoryBranchScopeId(char.uuid, target.id);
+                        await Promise.all([
                             deleteScopedStoredValue('chat', scopeId),
                             deleteScopedStoredValue('memories', scopeId),
                             deleteScopedStoredValue('classic_memories', scopeId)
-                        ]));
-                        scopeIds.forEach(scopeId => {
-                            delete memorySettings.emptyTurns?.[getMemoryEmptyTurnsKey(scopeId)];
-                        });
+                        ]);
+                        delete memorySettings.emptyTurns?.[getMemoryEmptyTurnsKey(scopeId)];
                         getUiTemplatesForRuntime(char).forEach(template => {
                             if (!template.runtimeByCharacter) return;
-                            scopeIds.forEach(scopeId => delete template.runtimeByCharacter[scopeId]);
+                            delete template.runtimeByCharacter[scopeId];
                         });
-                        storyBranches.value = storyBranches.value.filter(branch => !deleteIds.has(branch.id));
-                        selectedStoryBranchId.value = activeStoryBranchId.value;
+                        storyBranches.value.forEach(branch => {
+                            if (branch.parentId === target.id) branch.parentId = parentId;
+                        });
+                        storyBranches.value = storyBranches.value.filter(branch => branch.id !== target.id);
+                        selectedStoryBranchId.value = parentId;
                         await Promise.all([
                             saveStoryBranchesForCharacter(char),
                             saveMemorySettingsNow(),
                             setStoredValue('global_ui_templates', globalUiTemplates.value),
                             saveCharactersNow()
                         ]);
-                        showToast(`已删除“${target.name}”${childHint}`, 'success');
+                        showToast(`已删除“${target.name}”${hasChildren ? '，下级分支已顺延保留' : ''}`, 'success');
                     } catch (error) {
                         console.error('Failed to delete story branch:', error);
                         showToast(`删除分支失败：${error.message || '请稍后重试'}`, 'error');
@@ -8098,7 +7848,7 @@ const app = createApp({
                     sourceChatHistory = loadedChatHistory.slice(0, sourceIndex + 1);
                     forkTurn = buildConversationTurnSnapshot(sourceChatHistory, { includeSystem: false }).turns.length;
                     branchMemories = storedMemories.filter(memory => Number(memory?.turn) <= forkTurn);
-                    branchClassicMemories = storedClassicMemories.filter(memory => Number(memory?.turn) <= forkTurn);
+                    branchClassicMemories = trimClassicMemoriesToTurn(storedClassicMemories, forkTurn);
                 }
                 const floorCount = getPostprocessedChatMessages(sourceChatHistory, { includeSystem: false }).length;
                 const wordCount = getConversationBodyLength(sourceChatHistory);
@@ -8198,6 +7948,7 @@ const app = createApp({
             const target = storyBranches.value.find(branch => branch.id === branchId);
             if (!char?.uuid || !target || branchId === activeStoryBranchId.value || storyBranchSwitching.value) return;
             clearPendingChatImages();
+            clearPendingCardInteraction();
             storyBranchSwitching.value = true;
             try {
                 if (!await saveCurrentStoryBranchState()) return;
@@ -8287,18 +8038,21 @@ const app = createApp({
             return loaded;
         };
 
-        const selectCharacter = async (index, isNewImport = false) => {
+        const selectCharacter = async (index, isNewImport = false, { silent = false } = {}) => {
             const char = characters.value[index];
             if (!char) {
                 showToast('角色不存在，无法读取聊天记录', 'error');
                 return;
             }
             if (!isNewImport && currentCharacterIndex.value === index) {
-                currentView.value = 'chat';
-                await scrollChatToBottom();
-                return;
+                if (!silent) {
+                    currentView.value = 'chat';
+                    await scrollChatToBottom();
+                }
+                return true;
             }
             clearPendingChatImages();
+            clearPendingCardInteraction();
             const switchEpoch = ++_characterSwitchEpoch;
             const isLatestSwitch = () => switchEpoch === _characterSwitchEpoch;
             switchingCharacterIndex.value = index;
@@ -8383,23 +8137,24 @@ const app = createApp({
             // Sync image style rules
             if (isAutoImageGenEnabled.value) {
                 const messages = updateImageGenRegexState({ enableRegex: true });
-                if (messages && messages.length > 0) {
+                if (!silent && messages && messages.length > 0) {
                     showToast('已同步生图风格：' + messages.join('，'), 'success');
                 }
             }
 
-            currentView.value = 'chat';
-            await scrollChatToBottom();
-            if (!isLatestSwitch()) return;
-            showToast(`已切换到角色: ${char.name}`, 'success');
+            if (!silent) {
+                currentView.value = 'chat';
+                await scrollChatToBottom();
+                if (!isLatestSwitch()) return;
+                showToast(`已切换到角色: ${char.name}`, 'success');
 
-            // 弹出自动生图询问 (仅在导入新卡时)
-            if (isNewImport) {
-                showAutoImageGenModal.value = true;
+                // 弹出自动生图询问 (仅在导入新卡时)
+                if (isNewImport) showAutoImageGenModal.value = true;
             }
 
             _characterSwitchSavePromise = setStoredValue('last_active_char', index);
             await _characterSwitchSavePromise;
+            return isLatestSwitch();
             } finally {
                 if (isLatestSwitch()) switchingCharacterIndex.value = -1;
             }
@@ -8468,6 +8223,55 @@ const app = createApp({
             editingWorldInfo.data.keys = parseWorldInfoKeysText(worldInfoKeysText.value, editingWorldInfo.data.useRegex);
         };
 
+        const importCharacterData = async (rawData, avatarUrl, { askImageGeneration = true, activate = true } = {}) => {
+            const imported = cardUtils.parseImportedCharacterCard(rawData);
+            const char = {
+                name: imported.name,
+                description: imported.description,
+                first_mes: imported.first_mes,
+                avatar: avatarUrl || defaultAvatar,
+                personality: imported.personality,
+                creator_notes: imported.creator_notes,
+                worldInfo: imported.worldInfoEntries
+                    .map(entry => normalizeWorldInfoEntry({ ...entry, scope: 'character' }))
+                    .filter(entry => entry.scope !== 'global'),
+                regexScripts: imported.regexScripts
+                    .map(script => cardUtils.normalizeImportedRegexScript(
+                        { ...script, scope: 'character' },
+                        { fallbackScope: 'character', systemNames: systemRegexNames }
+                    ))
+                    .filter(script => script.scope !== 'global'),
+                uiTemplates: imported.uiTemplates.map(template => normalizeUiTemplate({
+                    ...sanitizeUiTemplateImportEntry(template),
+                    id: generateUUID(),
+                    scope: 'character'
+                })),
+                recentGenerationTimes: [],
+                uuid: generateUUID(),
+                createdAt: Date.now()
+            };
+
+            characters.value.push(char);
+            try {
+                await saveCharactersNow();
+            } catch (error) {
+                const index = characters.value.findIndex(item => item.uuid === char.uuid);
+                if (index >= 0) characters.value.splice(index, 1);
+                throw error;
+            }
+
+            if (!activate) return char;
+            showAddCharacterMenu.value = false;
+            if (currentView.value === 'characters' && useCharacterDeck.value) {
+                characterSearchQuery.value = '';
+                await nextTick();
+                await characterDeck.value?.revealImportedCard(char.uuid);
+            }
+            const newCharacterIndex = characters.value.findIndex(item => item.uuid === char.uuid);
+            await selectCharacter(newCharacterIndex, askImageGeneration);
+            return char;
+        };
+
         const importCharacter = (event) => {
             const file = event.target.files[0];
             if (!file) return;
@@ -8476,48 +8280,6 @@ const app = createApp({
 
             // Reset file input
             event.target.value = '';
-
-            const processCharacterData = async (rawData, avatarUrl) => {
-                try {
-                    const imported = cardUtils.parseImportedCharacterCard(rawData);
-                    const char = {
-                        name: imported.name,
-                        description: imported.description,
-                        first_mes: imported.first_mes,
-                        avatar: avatarUrl || defaultAvatar,
-                        personality: imported.personality,
-                        creator_notes: imported.creator_notes,
-                        worldInfo: imported.worldInfoEntries
-                            .map(entry => normalizeWorldInfoEntry({ ...entry, scope: 'character' }))
-                            .filter(entry => entry.scope !== 'global'),
-                        regexScripts: imported.regexScripts
-                            .map(script => cardUtils.normalizeImportedRegexScript(
-                                { ...script, scope: 'character' },
-                                { fallbackScope: 'character', systemNames: systemRegexNames }
-                            ))
-                            .filter(script => script.scope !== 'global'),
-                        uiTemplates: imported.uiTemplates.map(template => normalizeUiTemplate({
-                            ...sanitizeUiTemplateImportEntry(template),
-                            id: generateUUID(),
-                            scope: 'character'
-                        })),
-                        recentGenerationTimes: [],
-                        uuid: generateUUID(),
-                        createdAt: Date.now()
-                    };
-
-                    characters.value.push(char);
-
-                    // Auto-select the new character and enter chat immediately.
-                    const newCharacterIndex = characters.value.length - 1;
-                    showAddCharacterMenu.value = false;
-                    await selectCharacter(newCharacterIndex, true);
-
-                } catch (err) {
-                    console.error("Character processing error:", err);
-                    showToast('解析角色数据失败: ' + err.message, 'error');
-                }
-            };
 
             if (file.name.toLowerCase().endsWith('.jsonl')) {
                 const reader = new FileReader();
@@ -8635,7 +8397,7 @@ const app = createApp({
                 reader.onload = async (e) => {
                     try {
                         const data = JSON.parse(e.target.result);
-                        await processCharacterData(data, null);
+                        await importCharacterData(data, null);
                     } catch (err) {
                         showToast('JSON解析失败: ' + err.message, 'error');
                     }
@@ -8649,7 +8411,7 @@ const app = createApp({
                         const { data } = cardUtils.parsePngCharacterData(buffer);
                         const blob = new Blob([buffer], { type: 'image/png' });
                         const avatarUrl = await cardUtils.blobToDataUrl(blob);
-                        await processCharacterData(data, avatarUrl);
+                        await importCharacterData(data, avatarUrl);
                     } catch (err) {
                         if (err.chunks) console.warn("Available chunks:", Object.keys(err.chunks));
                         console.error(err);
@@ -8802,23 +8564,17 @@ const app = createApp({
 
         // Expose triggerSlash for character cards (Defined early)
         window.triggerSlash = async (text) => {
-            if (!text) return;
+            const command = String(text || '').trim();
+            if (!command) return;
 
-            if (isGenerating.value) {
+            if (isConversationBusy.value) {
                 showToast('正在生成中，请稍后...', 'warning');
                 return;
             }
 
-            const startTime = Date.now(); // Record trigger time
-
-            // Add user message with explicit reactivity update
-            const newMessage = { role: 'user', content: text, isSelf: true, isTriggered: true, shouldAnimate: true, skipReveal: true };
-            // Push and force update to ensure v-if picks up the new property
-            chatHistory.value = [...chatHistory.value, newMessage];
-
+            pendingCardInteraction.value = command;
             await nextTick();
-
-            await generateResponse(startTime);
+            inputBox.value?.focus();
         };
 
         // Lifecycle
@@ -8885,8 +8641,12 @@ const app = createApp({
             // 1.7.2 Enforce Default Preset (人格内核)
             syncBuiltinPreset(BUILTIN_PRESETS.personalityCore);
 
+            // 1.7.3 Enforce Default Preset (去User中心化)
+            syncBuiltinPreset(BUILTIN_PRESETS.deUserCentric);
+
             // 1.7.5 Enforce Default Preset (文风（抗八股）)
             syncBuiltinPreset(BUILTIN_PRESETS.writingStyle);
+            syncBuiltinPreset(BUILTIN_PRESETS.storyPanels);
 
             // 1.7.5.1 固定 NSFW增强在文风预设之后
             syncBuiltinPreset(BUILTIN_PRESETS.nsfw);
@@ -8913,33 +8673,56 @@ const app = createApp({
 
             // 1.10 Enforce Default Preset (COT)
             const cotPresetName = 'COT';
-            const syncCotPresetContent = () => {
+            const syncDynamicPresetContent = () => {
+                const useThinkingOpening = usesThinkingCotTag(settings.model);
+                const uiTemplateAnalysisEnabled = isUiTemplateAnalysisEnabled();
                 const cotPresetContent = buildCotPresetContent({
                     memoryEnabled: memorySettings.enabled,
-                    uiTemplateAnalysisEnabled: settings.uiTemplateEnabled
-                        && settings.uiTemplateMainModelAnalysis
-                        && activeUiTemplates.value.length > 0
+                    uiTemplateAnalysisEnabled,
+                    storyPanelsEnabled: isStoryPanelsEnabled.value,
+                    useThinkingOpening
                 });
-                const existingCotPreset = presets.value.find(p => p.name === cotPresetName);
+                let existingCotPreset = presets.value.find(p => p.name === cotPresetName);
                 if (!existingCotPreset) {
                     presets.value.push({
                         name: cotPresetName,
                         content: cotPresetContent,
                         enabled: true
                     });
-                    return;
-                }
-                if (existingCotPreset.content !== cotPresetContent) {
+                    existingCotPreset = presets.value.find(p => p.name === cotPresetName);
+                } else if (existingCotPreset.content !== cotPresetContent) {
                     existingCotPreset.content = cotPresetContent;
                 }
+
+                const prefillEnabled = isPresetEnabled(existingCotPreset);
+                BUILTIN_CORE_PRESETS.forEach(preset => {
+                    const prefillPhase = preset.name === '破限预注入 · AI 1' ? 1
+                        : preset.name === '破限预注入 · AI 2' ? 2
+                            : 0;
+                    if (!prefillPhase) return;
+                    const existingPreset = presets.value.find(item => item.name === preset.name);
+                    if (!existingPreset) return;
+                    existingPreset.content = buildCotPresetContent({
+                        memoryEnabled: memorySettings.enabled,
+                        uiTemplateAnalysisEnabled,
+                        useThinkingOpening,
+                        prefillPhase,
+                        prefillEnabled,
+                        prefillBaseContent: preset.content
+                    });
+                });
             };
-            syncCotPresetContent();
+            syncDynamicPresetContent();
             watch([
                 () => memorySettings.enabled,
                 () => settings.uiTemplateEnabled,
                 () => settings.uiTemplateMainModelAnalysis,
-                () => activeUiTemplates.value.length
-            ], syncCotPresetContent);
+                () => activeUiTemplates.value.length,
+                isStoryPanelsEnabled,
+                () => settings.model,
+                isTruncationEnabled,
+                () => presets.value.find(preset => preset.name === cotPresetName)?.enabled
+            ], syncDynamicPresetContent);
             removeLegacyUserRegex();
 
             // Save enforced defaults immediately (仅保存预设/正则等结构性数据)
@@ -9000,9 +8783,7 @@ const app = createApp({
                 selectCharacter(0);
             }
 
-            if (settings.autoFetchModels) {
-                fetchModels();
-            }
+            fetchModels();
 
             // Initial Status Check
             checkAllStatuses();
@@ -9022,9 +8803,6 @@ const app = createApp({
                     && !e.target.closest('.settings-help-trigger')
                     && !e.target.closest('.settings-help-popover')) {
                     settingsHelpTopic.value = '';
-                }
-                if (showInstructionPanel.value && !e.target.closest('.instruction-panel-container')) {
-                    showInstructionPanel.value = false;
                 }
                 if (showTokenUsageTimeFilter.value && !e.target.closest('.token-usage-time-filter-container')) {
                     showTokenUsageTimeFilter.value = false;
@@ -9057,25 +8835,55 @@ const app = createApp({
         const processMainContent = (mainText, isGeneratingState) => {
             mainText = stripUiTemplateUpdateBlock(mainText);
             if (!isGeneratingState) return { text: mainText, showSpinner: false };
-            const patterns = ['```html', '```vue', '<!DOCTYPE', '<div', '<style'];
-            let earliestIndex = -1;
-            for (const p of patterns) {
-                const idx = mainText.toLowerCase().indexOf(p);
-                if (idx !== -1 && (earliestIndex === -1 || idx < earliestIndex)) {
-                    earliestIndex = idx;
+            const imageStart = cardUtils.findLastUnprotectedMatch(mainText, /image###/gi)?.index ?? -1;
+            if (imageStart !== -1) {
+                const imageTail = mainText.slice(imageStart + 'image###'.length);
+                if (!imageTail.includes('###') && !/[\r\n]/.test(imageTail)) mainText = mainText.slice(0, imageStart);
+            }
+            // 只暂存未闭合的 UI；完整面板及其后的正文可以继续流式展示。
+            const uiTokens = /```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\r\n]*`|<!--[\s\S]*?(?:-->|$)|<(script|style)\b(?:[^"'<>]|"[^"]*"|'[^']*')*>[\s\S]*?(?:<\/\1\s*>|$)|<!doctype\b[^>]*(?:>|$)|<\/?[a-z][\w:-]*(?:[^"'<>]|"[^"]*(?:"|$)|'[^']*(?:'|$))*(>|$)/gi;
+            const openTags = [];
+            let pendingStart = -1;
+            const waitForUi = index => ({ text: mainText.slice(0, pendingStart < 0 ? index : pendingStart), showSpinner: true });
+            for (const match of mainText.matchAll(uiTokens)) {
+                const token = match[0];
+                const fence = token.startsWith('```') ? '```' : token.startsWith('~~~') ? '~~~' : '';
+                if (fence) {
+                    const isHtml = /^(?:```|~~~)[ \t]*(?:html|xml|vue)\b|^(?:```|~~~)[^\n]*\n\s*<(?:!doctype|html|head|body|div|span|style|script|table|img)\b/i.test(token);
+                    if (isHtml && (token.length < 6 || !token.endsWith(fence))) return waitForUi(match.index);
+                    continue;
+                }
+                if (token.startsWith('`') || token.startsWith('<!--')) continue;
+                if (match[1]) {
+                    if (!/<\/(?:script|style)\s*>$/i.test(token)) return waitForUi(match.index);
+                    continue;
+                }
+                if (/^<!doctype\b/i.test(token)) {
+                    if (pendingStart < 0) pendingStart = match.index;
+                    continue;
+                }
+                const tag = token.match(/^<(\/?)(html|div|script|style)(?=[\s/>]|$)/i);
+                if (!tag) continue;
+                if (match[2] !== '>') return waitForUi(match.index);
+                const name = tag[2].toLowerCase();
+                if (!tag[1]) {
+                    if (pendingStart < 0) pendingStart = match.index;
+                    openTags.push(name);
+                } else {
+                    const openIndex = openTags.lastIndexOf(name);
+                    if (openIndex < 0) continue;
+                    openTags.splice(openIndex);
+                    if (!openTags.length) pendingStart = -1;
                 }
             }
-            if (earliestIndex !== -1) {
-                return { text: mainText.substring(0, earliestIndex), showSpinner: true };
-            }
-            return { text: mainText, showSpinner: false };
+            return pendingStart < 0 ? { text: mainText, showSpinner: false } : waitForUi(pendingStart);
         };
 
         const switchProfile = (id) => {
             const profile = userProfiles.value.find(p => p.uuid === id);
             if (profile) {
                 activeProfileId.value = id;
-                Object.assign(user, JSON.parse(JSON.stringify(profile)));
+                Object.assign(user, { preferences: '', ...JSON.parse(JSON.stringify(profile)) });
                 saveData();
                 showToast(`已切换为人设: ${user.name}`, 'success');
             }
@@ -9086,6 +8894,7 @@ const app = createApp({
                 uuid: generateUUID(),
                 name: '新人设',
                 description: '',
+                preferences: '',
                 avatar: null,
                 person: 'second'
             };
@@ -9173,17 +8982,38 @@ const app = createApp({
             };
             const sortedMemories = [...classicMemories.value]
                 .map(memory => {
-                    const userChars = getLiveLength(memory.sourceUserIds, memory.sourceUserText);
-                    const assistantChars = getLiveLength(memory.sourceAssistantIds, memory.sourceAssistantText);
+                    const sourceMemories = isSecondaryClassicMemory(memory)
+                        ? getSecondaryClassicSourceMemories(memory)
+                        : [];
+                    const userFallback = memory.sourceUserText
+                        || sourceMemories.map(item => item.sourceUserText || '').filter(Boolean).join('\n\n');
+                    const assistantFallback = memory.sourceAssistantText
+                        || sourceMemories.map(item => item.sourceAssistantText || '').filter(Boolean).join('\n\n');
+                    const userChars = getLiveLength(memory.sourceUserIds, userFallback);
+                    const assistantChars = getLiveLength(memory.sourceAssistantIds, assistantFallback);
                     const summaryChars = parseCot(memory.summary || '').main.length;
+                    const liveTurns = (memory.sourceAssistantIds || [])
+                        .map(id => currentTurnsByAssistantId.get(id))
+                        .filter(Number.isFinite);
+                    const storedRange = getClassicMemoryTurnRange(memory);
+                    const displayTurnStart = isSecondaryClassicMemory(memory)
+                        ? (liveTurns.length ? Math.min(...liveTurns) : storedRange.start)
+                        : (liveTurns[0] || Number(memory.turn) || 1);
+                    const displayTurnEnd = isSecondaryClassicMemory(memory)
+                        ? (liveTurns.length ? Math.max(...liveTurns) : storedRange.end)
+                        : displayTurnStart;
                     return {
                         ...memory,
-                        displayTurn: (memory.sourceAssistantIds || []).map(id => currentTurnsByAssistantId.get(id)).find(Boolean) || memory.turn,
+                        displayTurn: displayTurnEnd,
+                        displayTurnStart,
+                        displayTurnEnd,
                         originalChars: userChars + assistantChars,
-                        compressedChars: userChars + summaryChars
+                        compressedChars: isSecondaryClassicMemory(memory)
+                            ? getClassicSecondaryMemoryMarker(memory).length + summaryChars
+                            : userChars + summaryChars
                     };
                 })
-                .sort((a, b) => (b.displayTurn || 0) - (a.displayTurn || 0));
+                .sort((a, b) => (b.displayTurnEnd || 0) - (a.displayTurnEnd || 0));
             const start = (classicMemoryPage.value - 1) * LIST_PAGE_SIZE;
             return sortedMemories.slice(start, start + LIST_PAGE_SIZE);
         });
@@ -9212,8 +9042,9 @@ const app = createApp({
             processMainContent, replaceUserNamePlaceholder,
             currentView, showDescriptionPanel, showModelSelector, modelSelectionTarget, openModelSelector, showChatModelSelector, showCharacterEditor, showAddCharacterMenu, showPresetEditor, showUiTemplateEditor,
             showActiveToolEditor,
-            showExportModal, sysInstruction, showInstructionPanel, exportItems, selectedExportIndices, // Export Modal
-            showContextViewerModal, lastContextMessages, lastTriggeredWorldInfos, lastContextTotalLength, // Context Viewer
+            showExportModal, exportItems, selectedExportIndices, // Export Modal
+            showContextViewerModal, lastContextMessages, lastTriggeredWorldInfos,
+            lastContextTotalLength, lastContextFloorCount, // Context Viewer
             showStoryBranchModal, showStoryBranchNameEditor, storyBranchNameDraft,
             storyBranches, storyRouteMap, currentStoryBranch, selectedStoryRouteNode,
             selectedStoryBranchId, storyBranchSwitching, storyRouteMapDragging,
@@ -9225,21 +9056,23 @@ const app = createApp({
             tokenUsageHistory, tokenUsagePage, tokenUsagePageCount, tokenUsageFilter, tokenUsageTimeFilter,
             showTokenUsageTimeFilter, tokenUsageTimeFilterOptions, tokenUsageTimeFilterLabel,
             filteredTokenUsageHistory, tokenUsageStats, displayedTokenUsageHistory,
+            latestMainTokenUsage, formatLatestTokenCount, formatLatestUsageCost,
             getUncachedInputTokens, formatTokenCount, formatTokenAggregate, formatTokenUsageTime, getTokenUsageTypeLabel, clearTokenUsageHistory,
             storageStats, refreshStorageStats, cleanupUnusedStorage, formatStorageSize,
             showCharacterExportModal, openCharacterExportModal, confirmCharacterExport, // Character Export Modal
             updateModalRef, latestUpdateConfig,
-            showConfirmModal, confirmMessage, modelMode, chatModelSlots, selectChatModelSlot, reasoningEffortSlider, reasoningEffortLabel, showNoMemoryNeededModal, // Export for template
-            isGenerating, isRemoteGenerating, remoteEstimatedTime, isReceiving, isThinking, hasActiveToolInlineWork, isConversationBusy, activeToolContinuationMessageId, activeToolContinuationHasResponse, userInput, pendingChatImages, pendingChatImageReadCount, isRecognizingImages, requestChatImageSelection, handleChatImageSelection, removePendingChatImage, modelSearchQuery, activeModelTag, modelTags, characterSearchQuery, filteredModels, filteredCharacters,
-            user, settings, apiProviderOptions, selectedApiProvider, isCustomApiProvider, customApiProviderOptions, showApiProviderSelector, selectApiProvider, characters, currentCharacter, currentCharacterIndex, switchingCharacterIndex, chatHistory, displayedChatMessages, handleChatScroll, presets, presetRoleOptions, fontFamilyOptions, fontSizeOptions, imageStyleOptions, imageSizeOptions, imageGenCountOptions, scopeOptions, uiTemplatePlacementOptions, worldInfoPositionOptions, getPresetRoleLabel, getPresetRoleDisplayLabel, getPresetRoleBadgeClass, regexScripts, worldInfo,
+            showConfirmModal, confirmMessage, modelMode, isGeminiModel, isTruncationEnabled, isPresetEnabled, chatModelSlots, selectChatModelSlot, reasoningEffortSlider, reasoningEffortLabel, showNoMemoryNeededModal, // Export for template
+            isGenerating, isRemoteGenerating, remoteEstimatedTime, isReceiving, isThinking, hasActiveToolInlineWork, isConversationBusy, activeToolContinuationMessageId, activeToolContinuationHasResponse, userInput, pendingCardInteraction, clearPendingCardInteraction, pendingChatImages, pendingChatImageReadCount, isRecognizingImages, requestChatImageSelection, handleChatImageSelection, removePendingChatImage, modelSearchQuery, activeModelTag, modelTags, characterSearchQuery, filteredModels, filteredCharacters,
+            user, settings, apiProviderOptions, selectedApiProvider, isCustomApiProvider, customApiProviderOptions, showApiProviderSelector, selectApiProvider, characters, currentCharacter, currentCharacterIndex, switchingCharacterIndex, chatHistory, displayedChatMessages, handleChatScroll, presets, presetRoleOptions, fontFamilyOptions, fontSizeOptions, availableImageStyleOptions, imageModelOptions, imageSizeOptions, imageGenCountOptions, scopeOptions, uiTemplatePlacementOptions, worldInfoPositionOptions, getPresetRoleLabel, getPresetRoleDisplayLabel, getPresetRoleBadgeClass, regexScripts, worldInfo,
             activeTools, activeToolAggressivenessOptions: ACTIVE_TOOL_AGGRESSIVENESS_OPTIONS, editingActiveTool, normalizeActiveTools, isWebActiveTool, getActiveToolDisplayDescription, getActiveToolResultCountMin, getActiveToolResultCountMax,
             getToolCallModeText, hasThinkingOrTools, isMessageThinkingOrRunning, isThinkingSummaryOpen, toggleThinkingSummary, markThinkingSummaryDetailOpened, getTimelineSteps,
+            isStyleFilterDetailsOpen, toggleStyleFilterDetails, getStyleFilterHitSegments,
             chatRoundStats, conversationBodyLength, summaryCompressedBodyLength, summaryCompressionRate,
             editingCharacter, editingPreset, editingUiTemplate, toasts, chatContainer, isChatFullscreen, isMobileKeyboardOpen, inputBox, messageElements,
             isGeneratorLoading, generatorUrl, onGeneratorLoad, // Generator exports
             isSquareLoading, squareUrl, onSquareLoad, // Square exports
             isNovelLoading, novelUrl, onNovelLoad, // Novel exports
-            editorTab, characterDisplayLimit, hasOpenedCharacterManager, isDesktopCharacterLayout, displayedCharacters, loadMoreCharacters,
+            editorTab, characterDisplayLimit, hasOpenedCharacterManager, isDesktopCharacterLayout, characterGridView, characterDeck, useCharacterDeck, displayedCharacters, loadMoreCharacters, getCharacterWICount, getCharacterRegexCount,
             isAutoImageGenEnabled,
             apiStatus, apiLatency, imageGenStatus, imageGenLatency, checkAllStatuses, // Status Exports
             toggleAutoImageGen, setWorldInfoEnabled, handleGeneratedImageReroll,
@@ -9292,103 +9125,10 @@ const app = createApp({
                     showToast(`${modeName}已清空`, 'success');
                 });
             },
-            exportMemories: async () => {
-                const isClassicMode = memorySettings.mode === MEMORY_MODE_CLASSIC;
-                let exportData;
-                if (isClassicMode) {
-                    if (classicMemories.value.length === 0) { showToast('当前模式没有记忆可导出', 'info'); return; }
-                    const exportedMemories = [...classicMemories.value]
-                        .sort((a, b) => (a.turn || 0) - (b.turn || 0))
-                        .map(memory => ({
-                            turn: memory.turn,
-                            user: {
-                                content: memory.sourceUserText || '',
-                                messageIds: memory.sourceUserIds || []
-                            },
-                            assistant: {
-                                content: memory.sourceAssistantText || '',
-                                messageIds: memory.sourceAssistantIds || []
-                            },
-                            summary: memory.summary
-                        }));
-                    exportData = {
-                        type: 'rp-hub-summary-memories',
-                        version: 1,
-                        character: currentCharacter.value?.name || 'unknown',
-                        exportedAt: new Date().toISOString(),
-                        total: exportedMemories.length,
-                        memories: exportedMemories
-                    };
-                } else {
-                    exportData = await compactMemoriesForStorageAsync(memories.value);
-                    if (exportData.length === 0) { showToast('当前模式没有记忆可导出', 'info'); return; }
-                }
-                const blob = downloadJsonFile(
-                    exportData,
-                    `${isClassicMode ? 'summary_memories' : 'vector_memories'}_${currentCharacter.value?.name || 'unknown'}.json`,
-                    isClassicMode ? 2 : 0,
-                    { revokeDelay: 1000 }
-                );
-                showToast(`${isClassicMode ? '总结模式' : '向量'}记忆已导出，约 ${Math.max(1, Math.round(blob.size / 1024))} KB`, 'success');
-            },
-            importMemories: (event) => readJsonFileInput(event, async data => {
-                const isClassicMode = memorySettings.mode === MEMORY_MODE_CLASSIC;
-                if (isClassicMode) {
-                    if (data?.type !== 'rp-hub-summary-memories' || !Array.isArray(data.memories)) {
-                        throw new Error('这不是总结模式记忆文件');
-                    }
-                    const normalized = prepareClassicMemoriesForRuntime(data.memories.map(memory => ({
-                        id: generateUUID(),
-                        timestamp: Date.now(),
-                        turn: memory?.turn,
-                        summary: memory?.summary,
-                        enabled: true,
-                        classicMemory: true,
-                        sourceUserIds: Array.isArray(memory?.user?.messageIds) ? memory.user.messageIds : [],
-                        sourceAssistantIds: Array.isArray(memory?.assistant?.messageIds) ? memory.assistant.messageIds : [],
-                        sourceUserText: String(memory?.user?.content || ''),
-                        sourceAssistantText: String(memory?.assistant?.content || '')
-                    })));
-                    if (normalized.length === 0) throw new Error('文件中没有有效的总结模式记忆');
-                    const existingKeys = new Set(classicMemories.value.map(memory => getClassicMemoryKey(memory.sourceAssistantIds, memory.turn)));
-                    const added = normalized.filter(memory => {
-                        const key = getClassicMemoryKey(memory.sourceAssistantIds, memory.turn);
-                        if (existingKeys.has(key)) return false;
-                        existingKeys.add(key);
-                        return true;
-                    });
-                    classicMemories.value = [...classicMemories.value, ...added];
-                    await saveClassicMemoriesNow();
-                    showToast(`成功导入 ${added.length} 条总结模式记忆`, 'success');
-                    return;
-                }
-
-                const items = Array.isArray(data) ? data : data?.memories;
-                if (!Array.isArray(items)) throw new Error('文件内容不正确');
-                const normalized = items
-                    .filter(m => m && m.vectorMemory === true && hasVectorEmbedding(m))
-                    .map(m => {
-                        const { importance, ...memoryData } = m;
-                        return {
-                            ...memoryData,
-                            id: memoryData.id || generateUUID(),
-                            timestamp: memoryData.timestamp || Date.now(),
-                            turn: memoryData.turn || 0,
-                            summary: String(memoryData.summary || memoryData.paragraph || '').trim(),
-                            vectorMemory: true,
-                            chunkMode: 'paragraph',
-                            enabled: memoryData.enabled !== false
-                        };
-                    });
-                if (normalized.length === 0) throw new Error('这不是向量记忆文件');
-                memories.value = [...memories.value, ...prepareMemoriesForRuntime(normalized)];
-                await saveMemoriesNow();
-                showToast(`成功导入 ${normalized.length} 个分片`, 'success');
-            }, error => showToast(`导入失败: ${error.message || 'JSON 格式错误'}`, 'error')),
             toggleMobileMenu, closeMobileMenu,
             fetchModels, selectModel, selectQuickModels, sendMessage, autoResizeInput, handleChatInputFocus, handleChatInputBlur, stopGeneration, clearChat, toggleChatFullscreen,
             handleConfirm, handleCancel, // Export handlers
-            copyMessage, playMessageActionFeedback, deleteMessage, regenerateMessage,
+            copyMessage, playMessageActionFeedback, canDeleteMessage, deleteMessage, regenerateMessage,
             editMessage, saveEditMessage, cancelEditMessage,
             createNewCharacter, editCharacter, saveCharacter, deleteCharacter, selectCharacter, toggleCharacterFavorite, isCharacterFavorite,
             currentUiTemplates, activeUiTemplates, uiTemplateUpdateStatus, createUiTemplate, editUiTemplate, saveUiTemplate, deleteUiTemplate, importUiTemplates, updateUiTemplatesFromChat, renderEditingUiTemplatePreview, handleUiTemplateClick,

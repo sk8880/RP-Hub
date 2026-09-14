@@ -5,7 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport"
         content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, interactive-widget=resizes-content">
-    <meta name="rphub-presence-api" content="https://rphub-presence.zeabur.app">
+    <meta name="rphub-update-api" content="https://rphub-presence.zeabur.app">
     <title>RP Hub</title>
     <!-- GitHub Pages rebuild marker for CSS-only animation update. -->
     <!-- <link rel="icon" href="logo.jpg" type="image/jpeg"> -->
@@ -121,10 +121,20 @@
     </svg>
     <div class="entry-transition" aria-hidden="true">
         <div class="entry-transition-brand">
+            <div class="entry-transition-book">
+                <svg viewBox="0 0 64 48" fill="none" aria-hidden="true">
+                    <path d="M4 8q14-6 28 0 14-6 28 0v34q-14-6-28 0-14-6-28 0Z" fill="#f6f9fe" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" />
+                    <path d="M32 8v34" stroke="currentColor" stroke-width="1.5" />
+                    <path d="M10 16q8-3 16 0m-16 7q8-3 16 0m-16 7q8-3 12-1m16-13q8-3 16 0m-16 7q8-3 16 0m-16 7q8-3 12-1" stroke="currentColor" stroke-opacity=".3" stroke-linecap="round" />
+                </svg>
+                <svg class="entry-book-page" viewBox="0 0 28 48" fill="none" aria-hidden="true">
+                    <path d="M0 8q14-6 28 0v34q-14-6-28 0Z" fill="#f6f9fe" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" />
+                    <path d="M6 16q8-3 16 0m-16 7q8-3 16 0m-16 7q8-3 12-1" stroke="currentColor" stroke-opacity=".3" stroke-linecap="round" />
+                </svg>
+            </div>
             <div class="entry-transition-logo">
                 <span class="entry-logo-rp">RP</span>
                 <span class="entry-logo-hub">HUB</span>
-                <i></i>
             </div>
         </div>
     </div>
@@ -195,7 +205,7 @@
                 <!-- Character Background Layer -->
                 <div v-if="settings.useCharacterBackground && currentCharacter && currentCharacter?.avatar"
                     class="absolute -inset-4 bg-cover bg-center bg-no-repeat pointer-events-none transition-opacity duration-500 z-0 blur-[2px] char-bg-blur"
-                    :style="{ backgroundImage: `url(${currentCharacter?.avatar})`, opacity: 0.9 }">
+                    :style="{ backgroundImage: `url(${JSON.stringify(currentCharacter.avatar)})`, opacity: 0.9 }">
                 </div>
 
                 <!-- Blur Overlay for Description Panel -->
@@ -313,7 +323,7 @@
                                 <button
                                     class="ml-1 p-1.5 text-white/60 hover:text-white hover:bg-white/20 rounded-full transition-all flex-shrink-0"
                                     :class="{'bg-white/20 text-white': showDescriptionPanel}">
-                                    <svg class="w-4 h-4 transition-transform duration-300 ease-out"
+                                    <svg class="desc-panel-chevron w-4 h-4"
                                         :class="{'rotate-180': showDescriptionPanel}" fill="none" stroke="currentColor"
                                         viewBox="0 0 24 24">
                                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
@@ -348,7 +358,7 @@
                 <!-- Chat Messages -->
                 <div ref="chatContainer" @click="showChatModelSelector = false"
                     @scroll="handleChatScroll"
-                    class="flex-1 overflow-y-auto overflow-x-hidden px-2 pt-14 md:pt-16 pb-44 md:pb-60 relative z-0 space-y-12 md:space-y-14 transition-all duration-500"
+                    class="flex-1 overflow-y-auto overflow-x-hidden px-2 pt-14 md:pt-16 pb-52 md:pb-60 relative z-0 space-y-12 md:space-y-14 transition-all duration-500"
                     :class="!settings.useCharacterBackground || !currentCharacter || !currentCharacter?.avatar ? 'bg-gray-50' : ''">
                     <div v-if="!currentCharacter"
                         class="flex flex-col items-center justify-center h-full text-gray-500">
@@ -532,7 +542,7 @@
                                                                                 </div>
                                                                                 <div v-else class="tool-call-detail flex flex-col gap-3 text-[13px]">
                                                                                     <div class="flex justify-between items-center text-[13px] border-b border-gray-200 pb-2">
-                                                                                        <span>调用标签: <code class="font-mono bg-white px-1 border rounded text-primary-600">&lt;{{ step.toolCall.callName }}&gt;</code></span>
+                                                                                        <span>调用工具: <code class="font-mono bg-white px-1 border rounded text-primary-600">&lt;{{ step.toolCall.callName }}&gt;</code></span>
                                                                                         <span class="text-gray-400 font-semibold">{{ getToolCallModeText(step.toolCall) }}</span>
                                                                                     </div>
                                                                                     <div class="flex flex-col gap-1.5">
@@ -604,26 +614,6 @@
                                                 </template>
                                             </template>
 
-                                            <!-- Sys Instruction Part -->
-                                            <div v-if="parseCot(msg.content).sys"
-                                                class="mt-2 mx-4 mb-3 p-3 bg-gradient-to-r from-gray-50/80 to-gray-100/50 backdrop-blur-sm rounded-xl border border-gray-200/60 shadow-sm flex flex-col gap-1.5 relative overflow-hidden group/sys">
-                                                <div class="absolute inset-0 bg-white/40 pointer-events-none"></div>
-                                                <div
-                                                    class="flex items-center text-gray-500 font-bold text-xs uppercase tracking-wider relative z-10">
-                                                    <svg class="w-3.5 h-3.5 mr-1" fill="none" stroke="currentColor"
-                                                        viewBox="0 0 24 24">
-                                                        <path stroke-linecap="round" stroke-linejoin="round"
-                                                            stroke-width="2"
-                                                            d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z">
-                                                        </path>
-                                                    </svg>
-                                                    临时指令
-                                                </div>
-                                                <div class="text-gray-600 leading-relaxed font-medium markdown-body relative z-10"
-                                                    :style="settings.fontSize ? { fontSize: (settings.fontSize - 1) + 'px' } : { fontSize: '13px' }"
-                                                    v-html="renderMarkdown(parseCot(msg.content).sys, 'user', true)">
-                                                </div>
-                                            </div>
                                             <div v-if="msg.role === 'assistant' && msg.uiTemplateBlocks && msg.uiTemplateBlocks.bottom && msg.uiTemplateBlocks.bottom.length"
                                                 class="ui-template-message-block ui-template-message-block-bottom">
                                                 <div v-for="(html, tIndex) in msg.uiTemplateBlocks.bottom"
@@ -635,13 +625,16 @@
                                                 class="ui-template-message-block ui-template-message-block-bottom">
                                                 <ui-template-pending></ui-template-pending>
                                             </div>
+                                            <div v-if="msg.responseError" class="response-error-text px-4 py-3"
+                                                :style="settings.fontSize ? { fontSize: settings.fontSize + 'px' } : {}"
+                                                role="alert">{{ msg.responseError }}</div>
                                         </div>
                                     </div>
 
                                     <!-- Message Actions -->
                                     <div v-if="!msg.isEditing_Message && !isMessageThinkingOrRunning(msg) && !(index === chatHistory.length - 1 && !msg.isSelf && (isGenerating || isRemoteGenerating)) && !(msg.isSelf && isConversationBusy && !chatHistory.slice(index + 1).some(m => m.isSelf))"
-                                        :class="['message-action-bar absolute bottom-0 -mb-9 md:-mb-10 flex items-center opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-opacity duration-200', msg.isSelf ? 'right-0' : 'left-0']">
-                                        <button v-if="index === chatHistory.length - 1"
+                                        :class="['message-action-bar absolute bottom-0 -mb-9 md:-mb-10 flex items-center transition-opacity duration-200', msg.isSelf ? 'right-0' : 'left-0', isStyleFilterDetailsOpen(msg, index) ? 'opacity-100' : 'opacity-100 md:opacity-0 md:group-hover:opacity-100']">
+                                        <button v-if="index === chatHistory.length - 1 && (msg.role === 'user' || chatHistory.slice(0, index).some(m => m.role === 'user'))"
                                             @click="regenerateMessage(index)"
                                             class="message-action-button"
                                             title="重新生成">
@@ -681,7 +674,7 @@
                                                 <use href="#icon-story-branch"></use>
                                             </svg>
                                         </button>
-                                        <button @click="deleteMessage(index)"
+                                        <button v-if="canDeleteMessage(index)" @click="deleteMessage(index)"
                                             class="message-action-button message-action-button--danger"
                                             title="删除">
                                             <svg class="w-3.5 h-3.5 md:w-4 md:h-4" fill="none" stroke="currentColor"
@@ -691,6 +684,38 @@
                                                 </path>
                                             </svg>
                                         </button>
+                                        <div v-if="msg.role === 'assistant' && Array.isArray(msg.styleFilterHits) && msg.styleFilterHits.length"
+                                            class="relative flex-none">
+                                            <div v-if="isStyleFilterDetailsOpen(msg, index)" @click.stop
+                                                class="message-style-filter-popover absolute bottom-full left-1/2 z-30 mb-2 w-[min(20rem,calc(100vw-1.5rem))] -translate-x-1/2 overflow-hidden rounded-2xl border border-gray-200 bg-white/95 shadow-xl backdrop-blur-xl">
+                                                <div class="border-b border-gray-100 bg-gray-50/80 px-3 py-2">
+                                                    <span class="text-xs font-bold text-gray-700">文风过滤详情</span>
+                                                </div>
+                                                <div class="max-h-56 space-y-1.5 overflow-y-auto p-2.5 custom-scrollbar">
+                                                    <div v-for="(fragment, filterIndex) in msg.styleFilterHits"
+                                                        :key="index + '-style-filter-' + filterIndex"
+                                                        class="flex items-start gap-1.5 rounded-xl border border-gray-100 bg-gray-50/70 px-2.5 py-2">
+                                                        <span class="w-3 flex-none text-right text-[11px] font-semibold leading-5 text-gray-900">{{ filterIndex + 1 }}</span>
+                                                        <span class="min-w-0 break-words text-xs leading-5 text-gray-600"><template
+                                                                v-for="(segment, segmentIndex) in getStyleFilterHitSegments(fragment)"
+                                                                :key="filterIndex + '-segment-' + segmentIndex"><span
+                                                                    :class="segment.matched ? 'font-semibold text-blue-500' : ''">{{ segment.text }}</span></template></span>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                            <button @click.stop="toggleStyleFilterDetails(msg, index)"
+                                                class="message-style-filter-button"
+                                                :class="{ 'is-active': isStyleFilterDetailsOpen(msg, index) }"
+                                                :title="'查看本条回复过滤的 ' + msg.styleFilterHits.length + ' 处内容'">
+                                                <svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 4h18M6 9h12M9 14h6M11 19h2"></path>
+                                                </svg>
+                                                <svg class="h-3 w-3 transition-transform" :class="{ 'rotate-180': isStyleFilterDetailsOpen(msg, index) }"
+                                                    fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
+                                                </svg>
+                                            </button>
+                                        </div>
                                     </div>
                                 </div>
                             </div>
@@ -737,6 +762,29 @@
                     class="absolute bottom-0 left-0 right-0 w-full p-2 md:p-3 z-30 pointer-events-none flex justify-center flex-shrink-0 transition-all duration-300 input-area-mobile">
                     <div
                         class="relative w-full max-w-lg md:max-w-[30rem] pointer-events-auto p-2.5 md:p-3 bg-white/90 backdrop-blur-xl border border-white/40 shadow-lg rounded-3xl ring-1 ring-black/5 transition-all duration-300 flex flex-col input-island">
+                        <transition enter-active-class="transition-all duration-200 ease-out"
+                            enter-from-class="opacity-0 translate-y-2 scale-95"
+                            enter-to-class="opacity-100 translate-y-0 scale-100"
+                            leave-active-class="transition-all duration-150 ease-in"
+                            leave-from-class="opacity-100 translate-y-0 scale-100"
+                            leave-to-class="opacity-0 translate-y-2 scale-95">
+                            <div v-if="pendingCardInteraction"
+                                :class="pendingChatImages.length ? 'bottom-[calc(100%+7.25rem)] md:bottom-[calc(100%+8.75rem)]' : 'bottom-[calc(100%+0.65rem)]'"
+                                class="absolute left-1 right-1 z-[3] flex justify-center">
+                                <div class="flex min-w-0 max-w-full items-center gap-2 rounded-2xl border border-primary-200/80 bg-white/95 px-3 py-2 text-xs shadow-lg ring-1 ring-black/5 backdrop-blur-xl">
+                                    <svg class="h-3.5 w-3.5 flex-none text-primary-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path>
+                                    </svg>
+                                    <span class="flex-none font-bold text-primary-600">卡片交互</span>
+                                    <span class="min-w-0 truncate text-gray-600" :title="pendingCardInteraction">{{ pendingCardInteraction }}</span>
+                                    <button type="button" @click="clearPendingCardInteraction" class="flex h-5 w-5 flex-none items-center justify-center rounded-full text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600" title="取消卡片交互" aria-label="取消卡片交互">
+                                        <svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M6 18L18 6M6 6l12 12"></path>
+                                        </svg>
+                                    </button>
+                                </div>
+                            </div>
+                        </transition>
                         <div v-if="pendingChatImages.length"
                             class="absolute left-3 bottom-[calc(100%+0.65rem)] z-[2] flex flex-nowrap gap-2.5 w-max max-w-[calc(100%-1.5rem)] overflow-x-auto py-1 pr-1">
                             <div v-for="image in pendingChatImages" :key="image.id"
@@ -760,6 +808,31 @@
                                     </svg>
                                 </button>
                             </div>
+                        </div>
+                        <div v-if="settings.showLatestUsageBar && latestMainTokenUsage"
+                            class="-mt-0.5 mx-1 mb-2 grid py-0.5 text-xs text-gray-500 md:-mt-1 md:text-[13px]"
+                            style="grid-template-columns: 4fr 3fr 4fr;">
+                            <span class="flex min-w-0 items-center justify-center gap-1 whitespace-nowrap px-1" title="输入 Token">
+                                <span class="h-1.5 w-1.5 flex-none rounded-full bg-primary-500"></span>
+                                <span class="inline-flex min-w-0 items-center gap-1 font-mono font-semibold tabular-nums">
+                                    <rolling-text class="text-gray-700" :value="formatLatestTokenCount(getUncachedInputTokens(latestMainTokenUsage))"></rolling-text>
+                                    <span v-if="Number(latestMainTokenUsage.cacheReadTokens) > 0"
+                                        class="inline-flex min-w-0 items-center gap-0.5 text-gray-500/80" title="缓存读取">
+                                        <svg class="h-3.5 w-3.5 flex-none" fill="none" stroke="currentColor" aria-hidden="true"><use href="#icon-arrow-down"></use></svg>
+                                        <rolling-text :value="formatLatestTokenCount(latestMainTokenUsage.cacheReadTokens)"></rolling-text>
+                                    </span>
+                                </span>
+                            </span>
+                            <span class="flex min-w-0 items-center justify-center gap-1 whitespace-nowrap px-1" title="输出 Token">
+                                <span class="h-1.5 w-1.5 flex-none rounded-full bg-yellow-400"></span>
+                                <rolling-text class="font-mono font-semibold tabular-nums text-gray-700"
+                                    :value="formatLatestTokenCount(latestMainTokenUsage.outputTokens)"></rolling-text>
+                            </span>
+                            <span class="flex min-w-0 items-center justify-center gap-1 whitespace-nowrap px-1" title="本次请求消耗">
+                                <span class="h-1.5 w-1.5 flex-none rounded-full bg-green-500"></span>
+                                <rolling-text class="font-mono font-semibold tabular-nums text-gray-700"
+                                    :value="formatLatestUsageCost(latestMainTokenUsage.actualQuota)"></rolling-text>
+                            </span>
                         </div>
                         <div class="relative w-full flex justify-between items-center mb-2 px-1">
                             <!-- Left controls: AutoImage -->
@@ -788,56 +861,6 @@
                                         </path>
                                     </svg>
                                 </button>
-                                <!-- Instruction Button -->
-                                <div class="relative instruction-panel-container">
-                                    <button @click="showInstructionPanel = !showInstructionPanel"
-                                        :class="[sysInstruction.trim() ? 'bg-primary-500 text-white shadow-primary-500/30 border-primary-500' : 'bg-white text-gray-500 hover:text-primary-600 hover:bg-gray-50 border-gray-200 shadow-sm']"
-                                        class="rounded-full w-8 h-8 flex items-center justify-center border transition-all active:scale-95"
-                                        title="单次系统指令">
-                                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                                                d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z">
-                                            </path>
-                                        </svg>
-                                    </button>
-                                    <!-- Instruction Panel Popover -->
-                                    <transition enter-active-class="transition-all duration-150 ease-out"
-                                        enter-from-class="opacity-0 translate-y-2 scale-95"
-                                        enter-to-class="opacity-100 translate-y-0 scale-100"
-                                        leave-active-class="transition-all duration-100 ease-in"
-                                        leave-from-class="opacity-100 translate-y-0 scale-100"
-                                        leave-to-class="opacity-0 translate-y-2 scale-95">
-                                        <div v-if="showInstructionPanel"
-                                            class="absolute bottom-full left-0 mb-4 z-50 pointer-events-auto w-[250px] md:w-[320px] transform-gpu origin-bottom-left">
-                                            <div
-                                                class="bg-white/95 backdrop-blur-xl border border-gray-200 shadow-xl rounded-2xl p-3 flex flex-col gap-2 ring-1 ring-black/5">
-                                                <div class="flex justify-between items-center mb-1 px-1">
-                                                    <span class="text-xs font-bold text-gray-600 flex items-center">
-                                                        <svg class="w-3.5 h-3.5 mr-1 text-primary-500" fill="none"
-                                                            stroke="currentColor" viewBox="0 0 24 24">
-                                                            <path stroke-linecap="round" stroke-linejoin="round"
-                                                                stroke-width="2"
-                                                                d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z">
-                                                            </path>
-                                                        </svg>
-                                                        临时指令
-                                                    </span>
-                                                    <button @click="showInstructionPanel = false"
-                                                        class="text-gray-400 hover:text-red-500 transition-colors bg-gray-100 hover:bg-red-50 p-1 rounded-full">
-                                                        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor"
-                                                            viewBox="0 0 24 24">
-                                                            <path stroke-linecap="round" stroke-linejoin="round"
-                                                                stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
-                                                        </svg>
-                                                    </button>
-                                                </div>
-                                                <textarea v-model="sysInstruction"
-                                                    class="w-full h-20 p-2.5 text-sm text-gray-700 bg-gray-50/30 rounded-xl border border-gray-200 focus:outline-none focus:ring-2 focus:ring-primary-400 focus:bg-white transition-all shadow-inner resize-none custom-scrollbar"
-                                                    placeholder="输入您想让AI遵守的临时规范指令... (随下次发送附带)"></textarea>
-                                            </div>
-                                        </div>
-                                    </transition>
-                                </div>
                                 <!-- Context Viewer Button -->
                                 <button @click="showContextViewerModal = true"
                                     class="rounded-full w-8 h-8 flex items-center justify-center border transition-all active:scale-95 bg-white text-gray-500 hover:text-blue-600 hover:bg-blue-50 border-gray-200 shadow-sm"
@@ -868,40 +891,79 @@
                                         leave-from-class="opacity-100 translate-y-0 scale-100"
                                         leave-to-class="opacity-0 translate-y-2 scale-95">
                                         <div v-if="showChatModelSelector"
-                                            class="absolute bottom-full right-0 mb-3 md:mb-4 z-50 pointer-events-auto w-[min(22rem,calc(100vw-1rem))] md:w-[min(24rem,calc(100vw-2rem))] transform-gpu origin-bottom-right">
-                                            <div @click.stop
-                                                class="bg-white/95 backdrop-blur-xl border border-gray-200/80 shadow-[0_12px_40px_rgba(0,0,0,0.12)] rounded-2xl p-3 flex flex-col gap-3 ring-1 ring-black/5 max-w-full overflow-hidden">
-                                                <div class="flex items-center justify-between px-0.5">
-                                                    <span class="text-sm font-bold text-gray-700">聊天模型</span>
-                                                    <span class="text-xs text-gray-400">快捷切换</span>
-                                                </div>
-                                                <div class="flex flex-col gap-1.5">
-                                                    <button v-for="(slot, slotIndex) in chatModelSlots" :key="slot.mode"
-                                                        type="button" @click="selectChatModelSlot(slot)"
-                                                        :disabled="!slot.model"
-                                                        :class="['flex min-w-0 items-center gap-3 rounded-xl border px-3 py-3 text-left transition-all', modelMode === slot.mode && slot.model ? 'border-primary-300 bg-primary-50 text-primary-700 shadow-sm' : 'border-gray-200 bg-white text-gray-500 hover:bg-gray-50', !slot.model ? 'cursor-not-allowed opacity-45' : 'active:scale-[0.98]']">
-                                                        <span class="flex-none text-xs font-bold">槽位 {{ slotIndex + 1 }}</span>
-                                                        <span class="min-w-0 flex-1 truncate text-right text-xs font-mono" :title="slot.model">{{ slot.model || '未配置' }}</span>
+                                            class="absolute bottom-full right-0 mb-3 z-50 pointer-events-auto w-[min(22rem,calc(100vw-3rem))] max-h-[calc(100dvh-12rem)] transform-gpu origin-bottom-right">
+                                            <div id="chat-quick-panel" @click.stop @keydown.esc.stop="showChatModelSelector = false"
+                                                role="dialog" aria-label="快捷面板"
+                                                class="chat-quick-panel bg-white/95 backdrop-blur-xl border border-white/80 shadow-[0_12px_40px_rgba(30,64,110,0.14)] rounded-2xl p-3 flex flex-col gap-3 ring-1 ring-gray-200/80 max-w-full max-h-[inherit] overflow-x-hidden overflow-y-auto overscroll-contain">
+                                                <div class="flex items-center justify-between pl-1">
+                                                    <h3 class="text-sm font-bold text-gray-700">快捷面板</h3>
+                                                    <button type="button" @click="showChatModelSelector = false" aria-label="关闭快捷面板"
+                                                        class="w-7 h-7 flex items-center justify-center rounded-full text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors">
+                                                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                                                            <path stroke-linecap="round" stroke-width="2" d="m6 6 12 12M18 6 6 18"></path>
+                                                        </svg>
                                                     </button>
                                                 </div>
-                                                <div class="border-t border-gray-100 pt-4 space-y-5">
-                                                    <div>
-                                                        <div class="mb-2 flex items-center justify-between">
-                                                            <span class="text-xs font-bold text-gray-500">推理强度</span>
-                                                            <span class="text-xs font-semibold text-gray-500">{{ reasoningEffortLabel }}</span>
+                                                <div class="chat-model-slots relative grid auto-rows-fr gap-1.5 rounded-xl bg-gray-100/70 p-1">
+                                                    <div class="segmented-switch__indicator flex items-center justify-end px-2.5 text-primary-600" aria-hidden="true"
+                                                        v-show="chatModelSlots.some(slot => slot.mode === modelMode && slot.model)"
+                                                        :style="{ '--slot-index': chatModelSlots.findIndex(slot => slot.mode === modelMode) }">
+                                                        <svg class="w-4 h-4 flex-none" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m5 12 4 4L19 6"></path>
+                                                        </svg>
+                                                    </div>
+                                                    <button v-for="(slot, slotIndex) in chatModelSlots" :key="slot.mode"
+                                                        type="button" @click="selectChatModelSlot(slot)"
+                                                        :disabled="!slot.model" :aria-pressed="modelMode === slot.mode && !!slot.model"
+                                                        :class="['relative z-10 flex min-w-0 items-center gap-2 rounded-lg px-2.5 py-2 text-left transition-colors', modelMode === slot.mode && slot.model ? 'text-primary-600' : 'text-gray-500', !slot.model ? 'cursor-not-allowed opacity-45' : 'hover:text-primary-600']">
+                                                        <span class="flex-none text-xs font-semibold">槽位 {{ slotIndex + 1 }}</span>
+                                                        <span class="min-w-0 flex-1 truncate text-[13px] font-medium" :title="slot.model">{{ slot.model || '未配置' }}</span>
+                                                        <span class="w-4 flex-none" aria-hidden="true"></span>
+                                                    </button>
+                                                </div>
+                                                <div class="flex flex-col gap-2 rounded-xl bg-gray-50 px-3 py-2.5">
+                                                    <div class="min-w-0">
+                                                        <div class="mb-1 flex flex-wrap items-center justify-between gap-x-1 text-xs">
+                                                            <span class="font-bold text-gray-500">推理强度</span>
+                                                            <span class="font-semibold text-gray-500">{{ reasoningEffortLabel }}</span>
                                                         </div>
                                                         <input v-model.number="reasoningEffortSlider" type="range" min="0" max="5" step="1"
-                                                            class="compact-range block w-full h-1.5 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-primary-500"
+                                                            class="compact-range block w-full appearance-none cursor-pointer accent-primary-500"
                                                             aria-label="推理强度">
                                                     </div>
-                                                    <div>
-                                                        <div class="mb-2 flex items-center justify-between">
-                                                            <span class="text-xs font-bold text-gray-500">温度</span>
-                                                            <span class="text-xs font-mono font-semibold text-gray-500 tabular-nums">{{ Number(settings.temperature).toFixed(2) }}</span>
+                                                    <div class="min-w-0 border-t border-gray-200/70 pt-2">
+                                                        <div class="mb-1 flex flex-wrap items-center justify-between gap-x-1 text-xs">
+                                                            <span class="font-bold text-gray-500">温度</span>
+                                                            <span class="font-mono font-semibold text-gray-500 tabular-nums">{{ Number(settings.temperature).toFixed(2) }}</span>
                                                         </div>
                                                         <input v-model.number="settings.temperature" type="range" min="0" max="1" step="0.01"
-                                                            class="compact-range block w-full h-1.5 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-primary-500">
+                                                            class="compact-range block w-full appearance-none cursor-pointer accent-primary-500" aria-label="温度">
                                                     </div>
+                                                </div>
+                                                <div class="flex flex-col gap-1 rounded-xl bg-gray-50">
+                                                    <label class="flex cursor-pointer items-center justify-between gap-1.5 rounded-xl bg-gray-50 px-2.5 py-2.5 text-xs font-semibold text-gray-600 whitespace-nowrap transition-colors hover:bg-gray-100">
+                                                        <span>流式输出</span>
+                                                        <span class="relative inline-flex flex-none items-center">
+                                                            <input v-model="settings.stream" type="checkbox" class="settings-toggle-input sr-only">
+                                                            <span class="settings-toggle settings-toggle--compact settings-toggle--solid"></span>
+                                                        </span>
+                                                    </label>
+                                                    <label class="flex cursor-pointer items-center justify-between gap-1.5 rounded-xl bg-gray-50 px-2.5 py-2.5 text-xs font-semibold text-gray-600 whitespace-nowrap transition-colors hover:bg-gray-100">
+                                                        <span>沉浸模式</span>
+                                                        <span class="relative inline-flex flex-none items-center">
+                                                            <input v-model="settings.immersiveMode" type="checkbox" class="settings-toggle-input sr-only">
+                                                            <span class="settings-toggle settings-toggle--compact settings-toggle--solid"></span>
+                                                        </span>
+                                                    </label>
+                                                </div>
+                                                <div v-if="isGeminiModel" class="rounded-xl bg-gray-50">
+                                                    <label class="flex cursor-pointer items-center justify-between gap-2 rounded-xl px-3 py-2.5 text-xs font-semibold text-gray-600 transition-colors hover:bg-gray-100">
+                                                        <span>Gemini抗截断</span>
+                                                        <span class="relative inline-flex flex-none items-center">
+                                                            <input v-model="settings.preventTruncation" type="checkbox" class="settings-toggle-input sr-only">
+                                                            <span class="settings-toggle settings-toggle--compact settings-toggle--solid"></span>
+                                                        </span>
+                                                    </label>
                                                 </div>
                                             </div>
                                         </div>
@@ -910,7 +972,7 @@
                                     <!-- Current Model Toggle Button -->
                                     <button @click.stop="showChatModelSelector = !showChatModelSelector"
                                         class="w-8 h-8 rounded-full transition-all duration-300 flex items-center justify-center bg-white text-gray-500 hover:text-gray-700 hover:bg-gray-50 border border-gray-200 shadow-sm active:scale-95"
-                                        title="切换模型">
+                                        title="快捷面板" aria-label="快捷面板" aria-controls="chat-quick-panel" :aria-expanded="showChatModelSelector">
                                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"
                                             aria-hidden="true">
                                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
@@ -931,7 +993,7 @@
                             <!-- Send/Stop Button -->
                             <div class="flex-shrink-0 flex items-center gap-1">
                                 <button v-if="!isConversationBusy" @click="sendMessage"
-                                    :disabled="(!userInput.trim() && pendingChatImages.length === 0) || isRecognizingImages || pendingChatImages.some(image => image.status !== 'ready')"
+                                    :disabled="(!userInput.trim() && pendingChatImages.length === 0 && !pendingCardInteraction) || isRecognizingImages || pendingChatImages.some(image => image.status !== 'ready')"
                                     class="p-2 md:p-2.5 bg-primary-600 text-white rounded-2xl md:hover:bg-primary-700 md:hover:shadow-lg md:hover:-translate-y-0.5 active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:translate-y-0 transition-all shadow-md flex items-center justify-center w-[44px] h-[44px] md:w-[46px] md:h-[46px]"
                                     title="发送">
                                     <svg class="w-5 h-5 transform rotate-90" fill="none"
@@ -957,9 +1019,10 @@
             </div>
 
             <!-- Characters Management -->
-            <div v-if="hasOpenedCharacterManager" v-show="currentView === 'characters'" class="management-view">
+            <div v-if="hasOpenedCharacterManager" v-show="currentView === 'characters'" class="management-view"
+                :class="{ 'character-management--deck': useCharacterDeck && filteredCharacters.length }">
                 <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 md:mb-6 gap-3">
-                    <div class="flex items-center justify-between w-full md:w-auto">
+                    <div class="flex flex-wrap items-center justify-between gap-2 w-full md:w-auto">
                         <div class="flex items-center">
                             <button @click="toggleMobileMenu"
                                 class="md:hidden mr-3 p-2 bg-white border border-gray-200 rounded-xl text-gray-500 shadow-sm active:scale-95 transition-all flex-shrink-0">
@@ -977,14 +1040,14 @@
                         </div>
 
                         <!-- Mobile Quick Actions -->
-                        <div class="flex md:hidden items-center space-x-2" v-if="!isBatchDeleteMode">
+                        <div class="flex md:hidden items-center space-x-2 ml-auto" v-if="!isBatchDeleteMode">
                             <button @click="toggleBatchDeleteMode"
                                 class="p-2.5 bg-white text-red-500 rounded-xl border border-gray-200 shadow-sm active:scale-95 transition-all"
                                 title="批量删除">
                                 <svg class="w-5 h-5" fill="none" stroke="currentColor"><use href="#icon-delete"></use></svg>
                             </button>
                             <button @click="showAddCharacterMenu = true"
-                                class="p-2.5 bg-primary-600 text-white rounded-xl shadow-sm active:scale-95 transition-all"
+                                class="settings-create-button"
                                 title="添加角色卡">
                                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
@@ -1015,50 +1078,56 @@
                     </div>
 
                     <!-- Search Controls -->
-                    <div class="flex flex-1 w-full md:w-auto md:max-w-md gap-2" v-if="!isBatchDeleteMode">
-                        <div class="relative flex-1 group">
+                    <div class="flex flex-1 min-w-0 w-full md:w-auto md:max-w-md gap-2" v-if="!isBatchDeleteMode">
+                        <div class="relative flex-1 min-w-0 group">
                             <input v-model="characterSearchQuery" type="text" placeholder="检索角色卡名称或描述..."
-                                class="w-full bg-white/80 backdrop-blur-sm border border-gray-200 rounded-2xl pl-10 pr-4 py-2.5 text-sm focus:ring-4 focus:ring-primary-500/10 focus:border-primary-500 outline-none transition-all shadow-sm group-hover:border-gray-300">
+                                class="w-full bg-white/80 backdrop-blur-sm border border-gray-200 rounded-2xl pl-10 pr-12 py-2.5 text-sm focus:ring-4 focus:ring-primary-500/10 focus:border-primary-500 outline-none transition-all shadow-sm group-hover:border-gray-300">
                             <svg class="w-5 h-5 text-gray-400 absolute left-3 top-1/2 transform -translate-y-1/2 transition-colors group-focus-within:text-primary-500"
                                 fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
                                     d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path>
                             </svg>
+                            <button type="button" @click="characterGridView = !characterGridView"
+                                class="absolute right-1.5 top-1/2 -translate-y-1/2 flex h-9 w-9 items-center justify-center rounded-xl text-gray-500 hover:bg-gray-100 hover:text-primary-600 active:scale-95 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-500/40"
+                                :title="useCharacterDeck ? '切换为网格布局' : '切换为叠卡布局'"
+                                :aria-label="useCharacterDeck ? '切换为网格布局' : '切换为叠卡布局'">
+                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
+                                        :d="useCharacterDeck ? 'M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z' : 'M8 3h8v18H8zM5 5H3v14h2m14-14h2v14h-2'"></path>
+                                </svg>
+                            </button>
                         </div>
                     </div>
 
                     <div class="hidden md:flex space-x-2 md:space-x-3 w-full md:w-auto pb-1" v-if="!isBatchDeleteMode">
                         <button @click="toggleBatchDeleteMode"
-                            class="flex-1 md:flex-none justify-center px-3 md:px-5 py-2.5 bg-white hover:bg-gray-50 text-red-600 rounded-xl border border-gray-200 transition-all shadow-sm hover:shadow flex items-center text-sm font-bold">
-                            <svg class="w-4 h-4 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                                    d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16">
-                                </path>
-                            </svg>
-                            删除
+                            class="p-2.5 bg-white text-red-500 rounded-xl border border-gray-200 shadow-sm active:scale-95 transition-all"
+                            title="批量删除" aria-label="批量删除">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor"><use href="#icon-delete"></use></svg>
                         </button>
                         <button @click="showAddCharacterMenu = true"
-                            class="flex-1 md:flex-none justify-center px-3 md:px-5 py-2.5 bg-primary-600 hover:bg-primary-700 text-white rounded-xl transition-all shadow-sm hover:shadow flex items-center text-sm font-bold">
-                            <svg class="w-4 h-4 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            class="settings-create-button"
+                            title="添加角色卡" aria-label="添加角色卡">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
                                     d="M12 4v16m8-8H4"></path>
                             </svg>
-                            添加
                         </button>
                     </div>
                     <div class="hidden md:flex space-x-2 md:space-x-3 w-full md:w-auto" v-else>
                         <button @click="toggleBatchDeleteMode"
-                            class="flex-1 md:flex-none justify-center px-4 py-2.5 bg-white hover:bg-gray-50 text-gray-700 rounded-xl border border-gray-200 transition-all shadow-sm hover:shadow flex items-center text-sm font-bold">
-                            取消选择
+                            class="p-2.5 bg-white text-gray-600 rounded-xl border border-gray-200 shadow-sm active:scale-95 transition-all"
+                            title="取消选择" aria-label="取消选择">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                            </svg>
                         </button>
                         <button @click="batchDeleteCharacters" :disabled="selectedCharacterIndices.size === 0"
-                            class="flex-1 md:flex-none justify-center px-4 py-2.5 bg-red-600 hover:bg-red-700 text-white rounded-xl transition-all shadow-sm hover:shadow flex items-center text-sm font-bold disabled:opacity-50 disabled:cursor-not-allowed">
-                            <svg class="w-4 h-4 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                                    d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16">
-                                </path>
-                            </svg>
-                            确认删除 ({{ selectedCharacterIndices.size }})
+                            class="relative p-2.5 bg-red-600 text-white rounded-xl shadow-sm active:scale-95 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                            title="确认删除" :aria-label="'确认删除 ' + selectedCharacterIndices.size + ' 张角色卡'">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor"><use href="#icon-delete"></use></svg>
+                            <span v-if="selectedCharacterIndices.size > 0"
+                                class="absolute -top-1 -right-1 bg-white text-red-600 text-[10px] font-bold px-1.5 py-0.5 rounded-full border border-red-200 shadow-sm leading-none">{{ selectedCharacterIndices.size }}</span>
                         </button>
                     </div>
                 </div>
@@ -1091,7 +1160,15 @@
                     </div>
                 </div>
 
-                <div :class="isDesktopCharacterLayout
+                <character-deck ref="characterDeck" v-if="filteredCharacters.length" v-show="useCharacterDeck"
+                    :visible="currentView === 'characters' && useCharacterDeck"
+                    :items="filteredCharacters" :active-id="currentCharacter?.uuid" :loading-index="switchingCharacterIndex"
+                    :world-info-count="getCharacterWICount" :regex-count="getCharacterRegexCount"
+                    @select="selectCharacter" @edit="editCharacter" @export-card="openCharacterExportModal"
+                    @toggle-favorite="toggleCharacterFavorite" @delete-card="deleteCharacter">
+                </character-deck>
+
+                <div v-if="!useCharacterDeck" :class="isDesktopCharacterLayout
                     ? 'grid md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6'
                     : 'grid grid-cols-2 gap-4'">
                     <character-card v-for="char in displayedCharacters"
@@ -1113,7 +1190,7 @@
                 </div>
 
                 <!-- Load More Button -->
-                <div v-if="characterDisplayLimit < filteredCharacters.length" class="mt-8 flex justify-center">
+                <div v-if="!useCharacterDeck && characterDisplayLimit < filteredCharacters.length" class="mt-8 flex justify-center">
                     <button @click="loadMoreCharacters"
                         class="px-8 py-3 bg-white border border-gray-200 text-primary-600 font-bold rounded-2xl shadow-sm hover:shadow-md active:scale-95 transition-all flex items-center">
                         <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1142,7 +1219,7 @@
             <!-- Novel View -->
             <div v-if="currentView === 'novel'" class="h-full overflow-hidden flex flex-col bg-gray-50 relative">
                 <embedded-view-content :src="novelUrl" :loading="isNovelLoading"
-                    loading-text="加载墨韵·造梦中..." @menu="toggleMobileMenu" @load="onNovelLoad">
+                    loading-text="加载小说生成中..." @menu="toggleMobileMenu" @load="onNovelLoad">
                 </embedded-view-content>
             </div>
 
@@ -1367,24 +1444,21 @@
                                         </div>
                                     </div>
 
+                                    <div class="group">
+                                        <label
+                                            class="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2 ml-1">偏好设定</label>
+                                        <textarea v-model="user.preferences" rows="4"
+                                            placeholder="偏好的互动方式、称呼或希望长期遵循的习惯..."
+                                            class="w-full bg-gray-50/60 border-2 border-gray-100 rounded-xl px-4 py-3 text-gray-800 focus:bg-white focus:border-primary-500 focus:ring-4 focus:ring-primary-100 focus:outline-none transition-all resize-y"></textarea>
+                                    </div>
+
                                     <!-- Description -->
                                     <div class="group">
                                         <label
                                             class="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2 ml-1">详细设定</label>
-                                        <div class="relative">
-                                            <textarea v-model="user.description" rows="6"
-                                                placeholder="描述您的外貌、性格、背景故事等..."
-                                                class="w-full bg-gray-50/60 border-2 border-gray-100 rounded-xl px-4 py-3 text-gray-800 focus:bg-white focus:border-primary-500 focus:ring-4 focus:ring-primary-100 focus:outline-none transition-all resize-y"></textarea>
-                                            <div class="absolute right-3 bottom-3 text-gray-300 pointer-events-none">
-                                                <svg class="w-5 h-5" fill="none" stroke="currentColor"
-                                                    viewBox="0 0 24 24">
-                                                    <path stroke-linecap="round" stroke-linejoin="round"
-                                                        stroke-width="2"
-                                                        d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z">
-                                                    </path>
-                                                </svg>
-                                            </div>
-                                        </div>
+                                        <textarea v-model="user.description" rows="6"
+                                            placeholder="外貌、性格、背景故事等..."
+                                            class="w-full bg-gray-50/60 border-2 border-gray-100 rounded-xl px-4 py-3 text-gray-800 focus:bg-white focus:border-primary-500 focus:ring-4 focus:ring-primary-100 focus:outline-none transition-all resize-y"></textarea>
                                     </div>
 
 
@@ -1474,9 +1548,13 @@
                             <!-- Main API Inputs -->
                             <div class="grid grid-cols-1 gap-5">
                                 <div class="group">
-                                    <label
-                                        class="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2 ml-1">API
-                                        提供商</label>
+                                    <div class="mb-2 ml-1 flex items-center justify-between gap-3">
+                                        <label class="text-xs font-bold text-gray-500 uppercase tracking-wider">API 提供商</label>
+                                        <a href="https://cdn.sta1n.cn/keys" target="_blank" rel="noopener noreferrer"
+                                            class="text-teal-600 hover:text-teal-700 hover:underline cursor-pointer transition-colors text-xs normal-case font-medium">
+                                            获取API
+                                        </a>
+                                    </div>
                                     <div class="relative mb-2 api-provider-selector-container">
                                         <button type="button" @click="showApiProviderSelector = !showApiProviderSelector"
                                             class="w-full h-12 bg-gray-50/60 border-2 border-gray-100 rounded-xl px-3 py-0 flex items-center justify-between text-left hover:bg-white hover:border-teal-300 hover:shadow-sm transition-all active:scale-[0.99]">
@@ -1589,7 +1667,7 @@
 
                                 <!-- Model Configuration Inputs -->
                                 <div class="grid grid-cols-1 md:grid-cols-2 gap-5 mt-5">
-                                    <div class="group order-1">
+                                    <div class="group">
                                         <label
                                             class="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2 ml-1">聊天模型</label>
                                         <div class="relative flex-1 group" @click="openModelSelector('quickModels')">
@@ -1612,35 +1690,7 @@
                                             </div>
                                         </div>
                                     </div>
-                                    <div class="group order-4 self-start w-full">
-                                        <div class="flex items-center justify-between mb-2 px-1">
-                                            <label
-                                                class="text-xs font-bold text-gray-500 uppercase tracking-wider">温度</label>
-                                            <span class="text-xs font-mono font-semibold text-gray-500 tabular-nums">{{
-                                                Number(settings.temperature).toFixed(2) }}</span>
-                                        </div>
-                                        <div
-                                            class="h-12 flex items-center px-4 bg-gray-50/60 border-2 border-gray-100 rounded-xl hover:bg-white hover:border-teal-300 hover:shadow-md transition-all">
-                                            <input v-model.number="settings.temperature" type="range" min="0" max="1"
-                                                step="0.01"
-                                                class="compact-range w-full h-1.5 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-teal-500 hover:accent-teal-400 transition-all">
-                                        </div>
-                                    </div>
-                                    <div class="group order-3 self-start w-full">
-                                        <div class="flex items-center justify-between mb-2 px-1">
-                                            <label
-                                                class="text-xs font-bold text-gray-500 uppercase tracking-wider">推理强度</label>
-                                            <span class="text-xs font-semibold text-gray-500">{{ reasoningEffortLabel }}</span>
-                                        </div>
-                                        <div
-                                            class="h-12 flex items-center px-4 bg-gray-50/60 border-2 border-gray-100 rounded-xl hover:bg-white hover:border-teal-300 hover:shadow-md transition-all">
-                                            <input v-model.number="reasoningEffortSlider" type="range" min="0" max="5"
-                                                step="1"
-                                                class="compact-range w-full h-1.5 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-teal-500 hover:accent-teal-400 transition-all"
-                                                aria-label="推理强度">
-                                        </div>
-                                    </div>
-                                    <div class="group order-2">
+                                    <div class="group">
                                         <label class="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2 ml-1">识图模型</label>
                                         <div class="relative flex-1 group" @click="openModelSelector('visionModel')">
                                             <div
@@ -1660,7 +1710,7 @@
                                             </div>
                                         </div>
                                     </div>
-                                    <div class="group order-6 col-span-1 md:col-span-2 mt-2">
+                                    <div class="group col-span-1 md:col-span-2 mt-2">
                                         <button @click="fetchModels(true)"
                                             class="w-full px-4 py-3 bg-white hover:bg-teal-50 text-gray-600 hover:text-teal-700 rounded-lg border border-gray-200 hover:border-teal-200 transition-all shadow-sm active:scale-95 whitespace-nowrap font-medium flex items-center justify-center text-sm"
                                             title="刷新列表">
@@ -1679,15 +1729,22 @@
 
                                 <!-- Image Generation Settings -->
                                 <div class="pt-6 border-t border-gray-100 mt-6">
-                                    <h4 class="settings-section-heading">
-                                        <svg class="w-4 h-4 mr-2 text-gray-400" fill="none" stroke="currentColor"
-                                            viewBox="0 0 24 24">
-                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                                                d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4">
-                                            </path>
-                                        </svg>
-                                        生图设置
-                                    </h4>
+                                    <div class="mb-4 flex items-center justify-between gap-3">
+                                        <h4 class="flex items-center text-xs font-bold text-gray-500 uppercase tracking-wider">
+                                            <svg class="w-4 h-4 mr-2 text-gray-500" fill="none" stroke="currentColor"
+                                                viewBox="0 0 24 24">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                    d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4">
+                                                </path>
+                                            </svg>
+                                            生图设置
+                                        </h4>
+                                        <a href="https://www.qianxun1688.com/links/D07F549B" target="_blank"
+                                            rel="noopener noreferrer"
+                                            class="text-teal-600 hover:text-teal-700 hover:underline cursor-pointer transition-colors text-xs normal-case font-medium">
+                                            获取生图密钥
+                                        </a>
+                                    </div>
                                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                                         <!-- Image Key -->
                                         <div
@@ -1699,12 +1756,22 @@
                                                 placeholder="STA1N-...">
                                         </div>
 
+                                        <!-- Image Model -->
+                                        <div class="generation-setting-card">
+                                            <label
+                                                class="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">生图版本</label>
+                                            <custom-select v-model="settings.imageModel" :options="imageModelOptions"
+                                                button-class="rounded-lg px-3 py-1.5 text-sm text-gray-700 focus:border-teal-400 focus:ring-teal-100"
+                                                menu-class="text-sm">
+                                            </custom-select>
+                                        </div>
+
                                         <!-- Image Style -->
                                         <div
                                             class="generation-setting-card">
                                             <label
                                                 class="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">生图风格</label>
-                                            <custom-select v-model="settings.imageStyle" :options="imageStyleOptions"
+                                            <custom-select v-model="settings.imageStyle" :options="availableImageStyleOptions"
                                                 button-class="rounded-lg px-3 py-1.5 text-sm text-gray-700 focus:border-teal-400 focus:ring-teal-100"
                                                 menu-class="text-sm">
                                             </custom-select>
@@ -1763,42 +1830,41 @@
                             <!-- Settings Toggles Grid -->
                             <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
                                 <label
-                                    class="flex items-center p-3 rounded-xl border-2 border-transparent hover:border-gray-100 hover:bg-gray-50 transition-all cursor-pointer group">
-                                    <div class="relative inline-flex items-center mr-2.5">
-                                        <input type="checkbox" v-model="settings.autoFetchModels" class="settings-toggle-input sr-only">
-                                        <div class="settings-toggle settings-toggle--indigo"></div>
-                                    </div>
+                                    class="flex items-center justify-between gap-3 p-3 text-left rounded-xl border-2 border-transparent hover:border-gray-100 hover:bg-gray-50 transition-all cursor-pointer group">
                                     <span
-                                        class="text-sm font-medium text-gray-600 group-hover:text-gray-900 transition-colors">自动获取模型</span>
-                                </label>
-                                <label
-                                    class="flex items-center p-3 rounded-xl border-2 border-transparent hover:border-gray-100 hover:bg-gray-50 transition-all cursor-pointer group">
-                                    <div class="relative inline-flex items-center mr-2.5">
-                                        <input type="checkbox" v-model="settings.stream" class="settings-toggle-input sr-only">
-                                        <div class="settings-toggle settings-toggle--indigo"></div>
-                                    </div>
-                                    <span
-                                        class="text-sm font-medium text-gray-600 group-hover:text-gray-900 transition-colors">流式输出
-                                    </span>
-                                </label>
-                                <label
-                                    class="flex items-center p-3 rounded-xl border-2 border-transparent hover:border-gray-100 hover:bg-gray-50 transition-all cursor-pointer group">
-                                    <div class="relative inline-flex items-center mr-2.5">
+                                        class="text-sm font-medium text-gray-600 group-hover:text-gray-900 transition-colors">使用封面背景</span>
+                                    <div class="relative inline-flex flex-none items-center">
                                         <input type="checkbox" v-model="settings.useCharacterBackground"
                                             class="settings-toggle-input sr-only">
                                         <div class="settings-toggle settings-toggle--indigo"></div>
                                     </div>
-                                    <span
-                                        class="text-sm font-medium text-gray-600 group-hover:text-gray-900 transition-colors">使用封面背景</span>
                                 </label>
                                 <label
-                                    class="flex items-center p-3 rounded-xl border-2 border-transparent hover:border-gray-100 hover:bg-gray-50 transition-all cursor-pointer group">
-                                    <div class="relative inline-flex items-center mr-2.5">
+                                    class="flex items-center justify-between gap-3 p-3 text-left rounded-xl border-2 border-transparent hover:border-gray-100 hover:bg-gray-50 transition-all cursor-pointer group">
+                                    <span
+                                        class="text-sm font-medium text-gray-600 group-hover:text-gray-900 transition-colors">沉浸模式</span>
+                                    <div class="relative inline-flex flex-none items-center">
                                         <input type="checkbox" v-model="settings.immersiveMode" class="settings-toggle-input sr-only">
                                         <div class="settings-toggle settings-toggle--indigo"></div>
                                     </div>
+                                </label>
+                                <label
+                                    class="flex items-center justify-between gap-3 p-3 text-left rounded-xl border-2 border-transparent hover:border-gray-100 hover:bg-gray-50 transition-all cursor-pointer group">
                                     <span
-                                        class="text-sm font-medium text-gray-600 group-hover:text-gray-900 transition-colors">沉浸模式</span>
+                                        class="text-sm font-medium text-gray-600 group-hover:text-gray-900 transition-colors">显示最新用量</span>
+                                    <div class="relative inline-flex flex-none items-center">
+                                        <input type="checkbox" v-model="settings.showLatestUsageBar" class="settings-toggle-input sr-only">
+                                        <div class="settings-toggle settings-toggle--indigo"></div>
+                                    </div>
+                                </label>
+                                <label
+                                    class="flex items-center justify-between gap-3 p-3 text-left rounded-xl border-2 border-transparent hover:border-gray-100 hover:bg-gray-50 transition-all cursor-pointer group">
+                                    <span
+                                        class="text-sm font-medium text-gray-600 group-hover:text-gray-900 transition-colors">文风过滤</span>
+                                    <div class="relative inline-flex flex-none items-center">
+                                        <input type="checkbox" v-model="settings.styleFilterEnabled" class="settings-toggle-input sr-only">
+                                        <div class="settings-toggle settings-toggle--indigo"></div>
+                                    </div>
                                 </label>
                             </div>
 
@@ -1931,6 +1997,7 @@
 
                 <div id="presets-list" class="space-y-4">
                     <div v-for="(preset, index) in presets" :key="preset.name + index"
+                        v-show="preset.name !== '第二人称' && preset.name !== '第三人称'"
                         class="bg-white p-4 rounded-xl border border-gray-200 flex items-center justify-between group shadow-sm hover:shadow-md transition-all">
                         <div class="flex items-center flex-1 min-w-0 mr-4">
                             <div class="cursor-move text-gray-400 mr-3 hover:text-gray-600 flex-shrink-0" title="拖动排序">
@@ -1949,8 +2016,12 @@
                             </div>
                         </div>
                         <div class="flex items-center space-x-4 flex-shrink-0">
-                            <label class="relative inline-flex items-center cursor-pointer">
-                                <input type="checkbox" v-model="preset.enabled" class="settings-toggle-input sr-only">
+                            <label class="relative inline-flex items-center"
+                                :class="preset.name === 'COT' && isTruncationEnabled ? 'cursor-not-allowed' : 'cursor-pointer'"
+                                :title="preset.name === 'COT' && isTruncationEnabled ? 'Gemini抗截断已临时关闭 COT，关闭抗截断或切换模型后恢复原设置' : null">
+                                <input type="checkbox" :checked="isPresetEnabled(preset)"
+                                    :disabled="preset.name === 'COT' && isTruncationEnabled"
+                                    @change="preset.enabled = $event.target.checked" class="settings-toggle-input sr-only">
                                 <div class="settings-toggle"></div>
                             </label>
                             <div class="flex space-x-1 border-l border-gray-200 pl-4">
@@ -2065,7 +2136,9 @@
                 <div
                     class="bg-white/70 backdrop-blur-sm p-1 rounded-2xl border border-gray-200 shadow-sm mb-4 overflow-hidden">
                     <button @click="showActiveToolSettings = !showActiveToolSettings"
-                        :class="['w-full flex justify-between items-center px-4 py-3 rounded-xl transition-all font-bold',
+                        class="settings-collapse-trigger" aria-controls="active-tool-settings-panel"
+                        :aria-expanded="showActiveToolSettings"
+                        :class="['w-full flex justify-between items-center px-4 py-3 rounded-xl font-bold',
                                      showActiveToolSettings ? 'bg-primary-50 text-primary-700' : 'text-gray-700 hover:bg-gray-50']">
                         <span class="flex items-center min-w-0">
                             <div
@@ -2080,28 +2153,34 @@
                         </span>
                         <span class="flex items-center flex-shrink-0">
                             <svg :class="{'transform rotate-180': showActiveToolSettings}"
-                                class="w-5 h-5 transition-transform duration-300" fill="none" stroke="currentColor"
+                                class="settings-collapse-chevron w-5 h-5" fill="none" stroke="currentColor"
                                 viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7">
                                 </path>
                             </svg>
                         </span>
                     </button>
-                    <div v-show="showActiveToolSettings" class="px-3 pb-3 pt-2 border-t border-gray-100 animate-fade-in">
-                        <div class="bg-gray-50/60 p-2.5 rounded-xl border border-gray-100">
-                            <div class="flex items-center mb-2">
-                                <label class="text-xs font-medium text-gray-500">调用工具积极性</label>
-                            </div>
-                            <div class="grid grid-cols-3 gap-1 rounded-xl bg-white border border-gray-200 p-1">
-                                <button v-for="option in activeToolAggressivenessOptions" :key="option.value"
-                                    type="button"
-                                    @click="settings.activeToolAggressiveness = option.value"
-                                    :class="['h-8 rounded-lg text-[13px] font-bold transition-all active:scale-[0.98]',
-                                        settings.activeToolAggressiveness === option.value
-                                            ? 'bg-primary-50 text-primary-700 shadow-sm ring-1 ring-primary-100'
-                                            : 'text-gray-500 hover:text-gray-700 hover:bg-gray-50']">
-                                    {{ option.label }}
-                                </button>
+                    <div id="active-tool-settings-panel" class="settings-collapse"
+                        :class="{ 'is-open': showActiveToolSettings }"
+                        :aria-hidden="!showActiveToolSettings" :inert="!showActiveToolSettings">
+                        <div class="settings-collapse__inner">
+                            <div class="settings-collapse__content px-4 pb-4 pt-3 border-t border-gray-100">
+                                <div class="text-sm font-semibold text-gray-700 mb-2">调用工具积极性</div>
+                                <div class="segmented-switch segmented-switch--compact segmented-switch--three w-full"
+                                    role="group" aria-label="调用工具积极性">
+                                    <div class="segmented-switch__indicator" aria-hidden="true"
+                                        :class="{
+                                            'is-position-2': settings.activeToolAggressiveness === 'active',
+                                            'is-position-3': settings.activeToolAggressiveness === 'adaptive'
+                                        }"></div>
+                                    <button v-for="option in activeToolAggressivenessOptions" :key="option.value"
+                                        type="button" @click="settings.activeToolAggressiveness = option.value"
+                                        class="segmented-switch__option"
+                                        :class="{ 'is-active': settings.activeToolAggressiveness === option.value }"
+                                        :aria-pressed="settings.activeToolAggressiveness === option.value">
+                                        {{ option.label }}
+                                    </button>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -2187,13 +2266,6 @@
                                 </svg>
                             </span>
                     </template>
-                    <button @click="exportMemories()" class="settings-icon-button" title="导出">
-                        <svg class="w-5 h-5" fill="none" stroke="currentColor"><use href="#icon-export"></use></svg>
-                    </button>
-                    <label class="settings-icon-button cursor-pointer" title="导入">
-                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><use href="#icon-import"></use></svg>
-                        <input type="file" accept=".json" @change="importMemories" class="hidden">
-                    </label>
                         <button @click="clearAllMemories()" v-if="memoryStats.activeTotal > 0"
                             class="p-2.5 bg-white text-red-600 rounded-xl border border-gray-200 shadow-sm active:scale-95 transition-all"
                             title="清空当前模式记忆">
@@ -2335,22 +2407,6 @@
                                     <input type="range" v-model.number="memorySettings.vectorTopK" min="10" max="20" step="1"
                                         class="compact-range w-full h-1.5 bg-primary-100 rounded-lg appearance-none cursor-pointer accent-primary-500">
                                 </div>
-                                <div class="settings-field">
-                                    <div class="flex justify-between items-center mb-2">
-                                        <div class="relative flex items-center">
-                                            <label class="text-sm font-semibold text-gray-700">最低召回相关度</label>
-                                            <settings-help topic="similarity" :open-topic="settingsHelpTopic"
-                                                label="查看最低召回相关度说明" @toggle="settingsHelpTopic = $event">
-                                                控制记忆分片的最低匹配程度。数值越高，不相关内容越少，但可能漏掉间接相关的记忆；数值越低，召回的记忆分片越多，同时也会增加关联较弱的结果。
-                                            </settings-help>
-                                        </div>
-                                        <span class="text-xs font-mono font-bold text-gray-600 bg-gray-50 border border-gray-200 rounded-lg px-2.5 py-1 whitespace-nowrap">{{
-                                            memorySettings.similarityThreshold + '%'
-                                            }}</span>
-                                    </div>
-                                    <input type="range" v-model.number="memorySettings.similarityThreshold" min="40" max="65" step="5"
-                                        class="compact-range w-full h-1.5 bg-primary-100 rounded-lg appearance-none cursor-pointer accent-primary-500">
-                                </div>
                             </template>
 
                             <div v-else class="settings-field">
@@ -2367,41 +2423,6 @@
                                     <span :class="memorySettings.classicModel ? 'text-gray-700' : 'text-gray-400'">{{
                                         memorySettings.classicModel || '请选择总结模式副模型' }}</span>
                                 </button>
-                            </div>
-
-                            <div v-if="memorySettings.mode === 'classic'"
-                                class="settings-field">
-                                <div class="relative mb-2 flex items-center">
-                                    <label class="text-sm font-semibold text-gray-700">总结程度</label>
-                                    <settings-help topic="summaryLevel" :open-topic="settingsHelpTopic"
-                                        label="查看总结程度说明" @toggle="settingsHelpTopic = $event">
-                                        控制每轮总结的目标篇幅。不同模型对中文字数的理解和遵循能力不同，实际结果可能略有偏差。
-                                    </settings-help>
-                                </div>
-                                <div class="segmented-switch segmented-switch--compact segmented-switch--three w-full">
-                                    <div class="segmented-switch__indicator" :class="{
-                                        'is-position-2': memorySettings.summaryLevel === 'balanced',
-                                        'is-position-3': memorySettings.summaryLevel === 'detailed'
-                                    }"></div>
-                                    <button type="button" @click="memorySettings.summaryLevel = 'concise'"
-                                        class="segmented-switch__option"
-                                        :class="{ 'is-active': memorySettings.summaryLevel === 'concise' }"
-                                        aria-label="精简总结，50 到 80 字">
-                                        精简
-                                    </button>
-                                    <button type="button" @click="memorySettings.summaryLevel = 'balanced'"
-                                        class="segmented-switch__option"
-                                        :class="{ 'is-active': memorySettings.summaryLevel === 'balanced' }"
-                                        aria-label="均衡总结，100 到 130 字">
-                                        均衡
-                                    </button>
-                                    <button type="button" @click="memorySettings.summaryLevel = 'detailed'"
-                                        class="segmented-switch__option"
-                                        :class="{ 'is-active': memorySettings.summaryLevel === 'detailed' }"
-                                        aria-label="详细总结，200 到 250 字">
-                                        详细
-                                    </button>
-                                </div>
                             </div>
 
                             <div v-if="memorySettings.mode === 'classic'" class="settings-field">
@@ -2561,7 +2582,11 @@
                                 <div class="mb-3 flex flex-wrap items-center justify-between gap-2 border-b border-gray-100 pb-2.5">
                                     <div class="flex items-center gap-2">
                                         <span class="h-1.5 w-1.5 rounded-full bg-primary-500"></span>
-                                        <span class="text-sm font-medium text-gray-800">第 {{ memory.displayTurn || '?' }} 轮</span>
+                                        <span class="text-sm font-medium text-gray-800">
+                                            第 {{ memory.displayTurnStart === memory.displayTurnEnd
+                                                ? memory.displayTurnStart
+                                                : memory.displayTurnStart + '-' + memory.displayTurnEnd }} 轮
+                                        </span>
                                     </div>
                                     <div class="flex items-center gap-2">
                                         <div class="flex items-baseline gap-1 text-[13px] font-medium text-gray-400"
@@ -2743,6 +2768,7 @@
 
         <add-character-modal :show="showAddCharacterMenu" @close="showAddCharacterMenu = false"
             @create="createNewCharacter(); showAddCharacterMenu = false"
+            @generate="showAddCharacterMenu = false; currentView = 'generator'"
             @import-character="importCharacter($event); showAddCharacterMenu = false"></add-character-modal>
 
         <character-editor-modal :show="showCharacterEditor" :character="editingCharacter.data"
@@ -2794,7 +2820,7 @@
             @update-field="editingWorldInfo.data[$event.field] = $event.value"
             @update-keys="updateEditingWorldInfoKeys"></world-info-editor-modal>
 
-        <context-viewer-modal :show="showContextViewerModal" :floors="chatRoundStats.floors"
+        <context-viewer-modal :show="showContextViewerModal" :floors="lastContextFloorCount"
             :total-length="lastContextTotalLength" :world-infos="lastTriggeredWorldInfos"
             :messages="lastContextMessages" @close="showContextViewerModal = false"></context-viewer-modal>
 
@@ -2816,9 +2842,10 @@
     <script>
         document.write('<script src="assets/js/built-in-content.js?v=' + new Date().getTime() + '"><\/script>');
         document.write('<script src="assets/js/core-utils.js?v=' + new Date().getTime() + '"><\/script>');
+        document.write('<script src="assets/js/api-utils.js?v=' + new Date().getTime() + '"><\/script>');
         document.write('<script src="assets/js/data-services.js?v=' + new Date().getTime() + '"><\/script>');
         document.write('<script src="assets/js/runtime-services.js?v=' + new Date().getTime() + '"><\/script>');
-        document.write('<script src="assets/js/presence.js?v=' + new Date().getTime() + '"><\/script>');
+        document.write('<script src="assets/js/update-check.js?v=' + new Date().getTime() + '"><\/script>');
         document.write('<script src="assets/js/ui-components.js?v=' + new Date().getTime() + '"><\/script>');
         document.write('<script src="assets/js/app.js?v=' + new Date().getTime() + '"><\/script>');
     </script>
