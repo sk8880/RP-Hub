@@ -988,7 +988,7 @@ window.RPHubUtils = {
         ]),
         activeTools: window.RPHubBuiltinContent.activeTools,
         uiOptions: Object.freeze({
-            popularModelFamilies: Object.freeze(['claude', 'gemini', 'deepseek', 'llama', 'glm', 'minimax', 'moonshot', 'grok']),
+            popularModelFamilies: Object.freeze(['claude', 'gemini', 'deepseek', 'llama', 'glm', 'moonshot', 'grok']),
             presetRoles: Object.freeze([
                 { value: 'system', label: '系统提示词' },
                 { value: 'user', label: 'User消息' },
@@ -1015,7 +1015,7 @@ window.RPHubUtils = {
             ]),
             imageModels: Object.freeze([
                 { value: 'nai-diffusion-4-5-full', label: 'V4.5 完整版（-1）' },
-                { value: 'nai-diffusion-5-full', label: 'V5 完整版（-5）' }
+                { value: 'nai-diffusion-5-full', label: 'V5 完整版（-8）' }
             ]),
             imageSizes: Object.freeze([
                 { value: '竖图', label: '竖图' },
