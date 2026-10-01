@@ -24,7 +24,7 @@ jobs:
         uses: actions/setup-java@v6
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: "21"
 
       - name: Prepare web files into www/
         run: |
@@ -50,13 +50,10 @@ jobs:
       - name: Fix AndroidManifest.xml (permissions + cleartext)
         run: |
           MANIFEST="android/app/src/main/AndroidManifest.xml"
-          # Add INTERNET permission if missing
           if ! grep -q "android.permission.INTERNET" "$MANIFEST"; then
             sed -i 's/<manifest/<\n<uses-permission android:name="android.permission.INTERNET"\/>\n<manifest/' "$MANIFEST"
           fi
-          # Add cleartext traffic + networkSecurityConfig to application tag
           sed -i 's/<application/<application android:usesCleartextTraffic="true" android:networkSecurityConfig="@xml\/network_security_config"/' "$MANIFEST"
-          # Create network_security_config.xml
           mkdir -p android/app/src/main/res/xml
           cat > android/app/src/main/res/xml/network_security_config.xml << 'EOF'
           <?xml version="1.0" encoding="utf-8"?>
@@ -69,18 +66,9 @@ jobs:
           </network-security-config>
           EOF
 
-      - name: Fix gradle.properties (aapt2)
-        run: |
-          mkdir -p ~/.gradle
-          ANDROID_HOME="$ANDROID_HOME"
-          if [ -z "$ANDROID_HOME" ]; then
-            ANDROID_HOME="/usr/local/lib/android/sdk"
-          fi
-          echo "android.aapt2FromMavenOverride=$ANDROID_HOME/build-tools/34.0.0/aapt2" >> ~/.gradle/gradle.properties 2>/dev/null || true
-
-      - name: Build debug APK (with stacktrace)
+      - name: Build debug APK
         working-directory: android
-        run: ./gradlew assembleDebug --no-daemon --stacktrace
+        run: ./gradlew assembleDebug --no-daemon
 
       - name: Upload APK
         uses: actions/upload-artifact@v6
