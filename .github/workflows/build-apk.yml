@@ -64,6 +64,56 @@ jobs:
           }
           EOF
 
+      - name: Setup fixed signing keystore
+        run: |
+          KS=".github/rphub-signing.b64"
+          if [ -f "$KS" ] && [ -s "$KS" ]; then
+            base64 -d "$KS" > /tmp/rphub.jks
+            echo "使用已有 keystore"
+          else
+            keytool -genkeypair -v \
+              -keystore /tmp/rphub.jks \
+              -alias rphub \
+              -keyalg RSA -keysize 2048 -validity 10950 \
+              -storepass rphub2026 -keypass rphub2026 \
+              -dname "CN=RPHub, OU=Self, O=Self, L=Unknown, S=Unknown, C=CN"
+            mkdir -p .github
+            base64 -w0 /tmp/rphub.jks > "$KS"
+            echo "已生成新 keystore"
+          fi
+          cat >> android/app/build.gradle << 'EOF'
+
+          android.signingConfigs {
+              rphubRelease {
+                  storeFile file("/tmp/rphub.jks")
+                  storePassword "rphub2026"
+                  keyAlias "rphub"
+                  keyPassword "rphub2026"
+                  v1SigningEnabled true
+                  v2SigningEnabled true
+              }
+          }
+          android.buildTypes.release {
+              signingConfig android.signingConfigs.rphubRelease
+          }
+          android.buildTypes.debug {
+              signingConfig android.signingConfigs.rphubRelease
+          }
+          EOF
+          echo "signing config injected"
+
+      - name: Persist keystore back to repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/rphub-signing.b64
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: persist signing keystore [skip ci]"
+            git push || echo "push failed, keystore not persisted"
+          else
+            echo "keystore unchanged"
+          fi
+
       - name: Fix AndroidManifest.xml (permissions)
         run: |
           python3 - <<'PY'
@@ -296,12 +346,12 @@ jobs:
           }
           EOF
 
-      - name: Build debug APK
+      - name: Build release APK
         working-directory: android
-        run: ./gradlew assembleDebug --no-daemon
+        run: ./gradlew assembleRelease --no-daemon
 
       - name: Upload APK
         uses: actions/upload-artifact@v6
         with:
           name: rphub-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          path: android/app/build/outputs/apk/release/app-release.apk
