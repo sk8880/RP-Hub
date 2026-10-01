@@ -1,0 +1,49 @@
+name: Build RP-Hub APK
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+
+      - name: Setup JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Capacitor
+        run: |
+          npm init -y
+          npm i @capacitor/core @capacitor/cli
+          npx cap init RPHub com.sk8880.rphub --web-dir=.
+
+      - name: Add Android platform
+        run: |
+          npm i @capacitor/android
+          npx cap add android
+          npx cap sync
+
+      - name: Build debug APK
+        working-directory: android
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v6
+        with:
+          name: rphub-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
