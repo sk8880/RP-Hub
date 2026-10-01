@@ -1,0 +1,89 @@
+name: Build RP-Hub APK
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+
+      - name: Setup JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Prepare web files into www/
+        run: |
+          mkdir -p www
+          cp index.html www/
+          cp -r assets www/
+          cp -r character www/ 2>/dev/null || true
+          cp -r novel www/ 2>/dev/null || true
+          cp CNAME www/ 2>/dev/null || true
+
+      - name: Install Capacitor
+        run: |
+          npm init -y
+          npm i @capacitor/core @capacitor/cli
+          npx cap init RPHub com.sk8880.rphub --web-dir=www
+
+      - name: Add Android platform
+        run: |
+          npm i @capacitor/android
+          npx cap add android
+          npx cap sync
+
+      - name: Fix AndroidManifest.xml (permissions + cleartext)
+        run: |
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          # Add INTERNET permission if missing
+          if ! grep -q "android.permission.INTERNET" "$MANIFEST"; then
+            sed -i 's/<manifest/<\n<uses-permission android:name="android.permission.INTERNET"\/>\n<manifest/' "$MANIFEST"
+          fi
+          # Add cleartext traffic + networkSecurityConfig to application tag
+          sed -i 's/<application/<application android:usesCleartextTraffic="true" android:networkSecurityConfig="@xml\/network_security_config"/' "$MANIFEST"
+          # Create network_security_config.xml
+          mkdir -p android/app/src/main/res/xml
+          cat > android/app/src/main/res/xml/network_security_config.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <network-security-config>
+              <base-config cleartextTrafficPermitted="true">
+                  <trust-anchors>
+                      <certificates src="system" />
+                  </trust-anchors>
+              </base-config>
+          </network-security-config>
+          EOF
+
+      - name: Fix gradle.properties (aapt2)
+        run: |
+          mkdir -p ~/.gradle
+          ANDROID_HOME="$ANDROID_HOME"
+          if [ -z "$ANDROID_HOME" ]; then
+            ANDROID_HOME="/usr/local/lib/android/sdk"
+          fi
+          echo "android.aapt2FromMavenOverride=$ANDROID_HOME/build-tools/34.0.0/aapt2" >> ~/.gradle/gradle.properties 2>/dev/null || true
+
+      - name: Build debug APK (with stacktrace)
+        working-directory: android
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v6
+        with:
+          name: rphub-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
