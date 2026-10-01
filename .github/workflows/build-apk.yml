@@ -59,19 +59,32 @@ jobs:
           }
           EOF
 
-      - name: Fix AndroidManifest.xml
+      - name: Fix AndroidManifest.xml (permissions)
         run: |
           python3 - <<'PY'
           import re, os
           p = "android/app/src/main/AndroidManifest.xml"
           s = open(p).read()
-          if "android.permission.INTERNET" not in s:
+          perms = [
+              'android.permission.INTERNET',
+              'android.permission.ACCESS_NETWORK_STATE',
+          ]
+          for perm in perms:
+              if perm not in s:
+                  s = re.sub(r'(<manifest[^>]*>)',
+                             r'\1\n    <uses-permission android:name="%s" />' % perm,
+                             s, count=1)
+          if 'READ_EXTERNAL_STORAGE' not in s:
               s = re.sub(r'(<manifest[^>]*>)',
-                         r'\1\n    <uses-permission android:name="android.permission.INTERNET" />',
+                         r'\1\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />',
                          s, count=1)
-          if "usesCleartextTraffic" not in s:
+          if 'WRITE_EXTERNAL_STORAGE' not in s:
+              s = re.sub(r'(<manifest[^>]*>)',
+                         r'\1\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />',
+                         s, count=1)
+          if 'usesCleartextTraffic' not in s:
               s = s.replace("<application",
-                            '<application android:usesCleartextTraffic="true" android:networkSecurityConfig="@xml/network_security_config"', 1)
+                            '<application android:usesCleartextTraffic="true" android:requestLegacyExternalStorage="true" android:networkSecurityConfig="@xml/network_security_config"', 1)
           open(p, "w").write(s)
           os.makedirs("android/app/src/main/res/xml", exist_ok=True)
           open("android/app/src/main/res/xml/network_security_config.xml", "w").write(
@@ -85,6 +98,204 @@ jobs:
               '</network-security-config>\n')
           print("manifest patched")
           PY
+
+      - name: Write custom MainActivity (export/import support)
+        run: |
+          mkdir -p android/app/src/main/java/com/sk8880/rphub
+          cat > android/app/src/main/java/com/sk8880/rphub/MainActivity.java << 'EOF'
+          package com.sk8880.rphub;
+
+          import android.Manifest;
+          import android.app.DownloadManager;
+          import android.content.ContentValues;
+          import android.content.pm.PackageManager;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.provider.MediaStore;
+          import android.util.Base64;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.MimeTypeMap;
+          import android.webkit.URLUtil;
+          import android.webkit.WebView;
+          import android.widget.Toast;
+
+          import com.getcapacitor.BridgeActivity;
+
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.OutputStream;
+
+          public class MainActivity extends BridgeActivity {
+
+              private static final int REQ_STORAGE = 1001;
+              private WebView webViewRef;
+
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  requestStoragePermission();
+              }
+
+              @Override
+              public void onStart() {
+                  super.onStart();
+                  setupDownload();
+              }
+
+              private void requestStoragePermission() {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                      return;
+                  }
+                  if (checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                          != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(new String[]{
+                              Manifest.permission.READ_EXTERNAL_STORAGE,
+                              Manifest.permission.WRITE_EXTERNAL_STORAGE
+                      }, REQ_STORAGE);
+                  }
+              }
+
+              private void setupDownload() {
+                  try {
+                      WebView wv = findViewById(com.getcapacitor.android.R.id.webview);
+                      if (wv == null) {
+                          return;
+                      }
+                      webViewRef = wv;
+                      wv.getSettings().setJavaScriptEnabled(true);
+                      wv.addJavascriptInterface(new Object() {
+                          @JavascriptInterface
+                          public void saveBase64(final String data, final String fileName, final String mimeType) {
+                              runOnUiThread(new Runnable() {
+                                  @Override
+                                  public void run() {
+                                      saveFile(data, fileName, mimeType);
+                                  }
+                              });
+                          }
+                      }, "AndroidDownloader");
+
+                      wv.setDownloadListener(new android.webkit.DownloadListener() {
+                          @Override
+                          public void onDownloadStart(final String url, String userAgent,
+                                                      String contentDisposition,
+                                                      String mimeType, long contentLength) {
+                              if (url == null) {
+                                  return;
+                              }
+                              String fileName = URLUtil.guessFileName(url, contentDisposition, mimeType);
+                              String mt = (mimeType == null || mimeType.isEmpty()) ? "*/*" : mimeType;
+                              if (url.startsWith("blob:")) {
+                                  fetchBlob(url, fileName, mt);
+                              } else if (url.startsWith("data:")) {
+                                  int idx = url.indexOf(',');
+                                  if (idx >= 0) {
+                                      saveFile(url.substring(idx + 1), fileName, mt);
+                                  }
+                              } else {
+                                  downloadByManager(url, fileName, mt);
+                              }
+                          }
+                      });
+                  } catch (Exception e) {
+                      Toast.makeText(this, "init fail: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                  }
+              }
+
+              private void fetchBlob(final String blobUrl, String fileName, String mimeType) {
+                  final String fn = safe(fileName);
+                  final String mt = safe(mimeType);
+                  runOnUiThread(new Runnable() {
+                      @Override
+                      public void run() {
+                          try {
+                              String js = "javascript:(function(){"
+                                      + "var xhr=new XMLHttpRequest();"
+                                      + "xhr.open('GET','" + blobUrl + "',true);"
+                                      + "xhr.responseType='blob';"
+                                      + "xhr.onload=function(){if(xhr.status===200){var r=new FileReader();"
+                                      + "r.onloadend=function(){var s=r.result;var i=s.indexOf(',');if(i>=0)s=s.substring(i+1);"
+                                      + "if(typeof AndroidDownloader!=='undefined'){AndroidDownloader.saveBase64(s,'" + fn + "','" + mt + "');}};"
+                                      + "r.readAsDataURL(xhr.response);}};"
+                                      + "xhr.send();})()";
+                              webViewRef.evaluateJavascript(js, null);
+                          } catch (Exception e) {
+                              Toast.makeText(MainActivity.this, "导出失败: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                          }
+                      }
+                  });
+              }
+
+              private static String safe(String s) {
+                  if (s == null) {
+                      return "";
+                  }
+                  return s.replace("\\", "\\\\").replace("'", "\\'");
+              }
+
+              private void downloadByManager(String url, String fileName, String mimeType) {
+                  try {
+                      DownloadManager.Request req = new DownloadManager.Request(Uri.parse(url));
+                      req.setMimeType(mimeType);
+                      req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+                      req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, "RP-Hub/" + fileName);
+                      req.allowScanningByMediaScanner();
+                      DownloadManager dm = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
+                      if (dm != null) {
+                          dm.enqueue(req);
+                          Toast.makeText(this, "已开始下载: " + fileName, Toast.LENGTH_SHORT).show();
+                      }
+                  } catch (Exception e) {
+                      Toast.makeText(this, "下载失败: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                  }
+              }
+
+              private void saveFile(String base64Data, String fileName, String mimeType) {
+                  try {
+                      if (base64Data == null || base64Data.length() == 0) {
+                          throw new Exception("数据为空");
+                      }
+                      byte[] bytes = Base64.decode(base64Data, Base64.DEFAULT);
+                      String name = fileName;
+                      if (name == null || name.isEmpty() || name.equals("download") || name.equals("downloadfile")) {
+                          String ext = MimeTypeMap.getSingleton().getExtensionFromMimeType(mimeType);
+                          name = "rphub_" + System.currentTimeMillis() + (ext != null ? "." + ext : ".json");
+                      }
+                      OutputStream os;
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                          ContentValues cv = new ContentValues();
+                          cv.put(MediaStore.Downloads.DISPLAY_NAME, name);
+                          cv.put(MediaStore.Downloads.MIME_TYPE, mimeType != null ? mimeType : "*/*");
+                          cv.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/RP-Hub");
+                          cv.put(MediaStore.Downloads.IS_PENDING, 1);
+                          Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv);
+                          if (uri == null) {
+                              throw new Exception("无法创建文件");
+                          }
+                          os = getContentResolver().openOutputStream(uri);
+                          cv.clear();
+                          cv.put(MediaStore.Downloads.IS_PENDING, 0);
+                          getContentResolver().update(uri, cv, null, null);
+                      } else {
+                          File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "RP-Hub");
+                          if (!dir.exists()) {
+                              dir.mkdirs();
+                          }
+                          File f = new File(dir, name);
+                          os = new FileOutputStream(f);
+                      }
+                      os.write(bytes);
+                      os.flush();
+                      os.close();
+                      Toast.makeText(this, "已保存: 下载/RP-Hub/" + name, Toast.LENGTH_LONG).show();
+                  } catch (Exception e) {
+                      Toast.makeText(this, "保存失败: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                  }
+              }
+          }
+          EOF
 
       - name: Build debug APK
         working-directory: android
