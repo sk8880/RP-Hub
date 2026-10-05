@@ -40,6 +40,53 @@ jobs:
           done
           echo "paths patched"
 
+      - name: Inject JS error diagnostics
+        run: |
+          python3 - <<'PY'
+          import os, re
+          snippet = """<script>
+          (function(){
+          var shown={};
+          function out(msg){
+          try{
+          if(shown[msg])return;shown[msg]=1;
+          var d=document.createElement('div');
+          d.setAttribute('data-rpdebug','1');
+          d.style.cssText='position:fixed;z-index:2147483647;top:0;left:0;right:0;background:#000000;color:#00ff00;font-size:11px;line-height:14px;padding:6px;word-break:break-all;max-height:60vh;overflow:auto;';
+          d.textContent='RPDEBUG: '+msg;
+          (document.body||document.documentElement).appendChild(d);
+          }catch(e){}
+          try{alert('RPDEBUG: '+msg);}catch(e){}
+          }
+          window.addEventListener('error',function(e){
+          out((e.message||'?')+' | '+(e.filename||'?')+':'+(e.lineno||'?'));
+          },true);
+          window.addEventListener('unhandledrejection',function(e){
+          var r=e.reason;var m=(r&&r.message)?r.message:String(r);
+          out('PROMISE: '+m);
+          });
+          var oe=console.error;
+          console.error=function(){try{out('CONSOLE: '+Array.prototype.slice.call(arguments).join(' '));}catch(e){}oe.apply(console,arguments);};
+          })();
+          </script>"""
+          p = "www/index.html"
+          if not os.path.exists(p):
+              print("index.html not found, skip")
+          else:
+              s = open(p, encoding="utf-8", errors="ignore").read()
+              if "RPDEBUG" not in s:
+                  if re.search(r'<head', s, re.I):
+                      s = re.sub(r'(<head[^>]*>)', lambda m: m.group(1) + "\n" + snippet, s, count=1, flags=re.I)
+                  elif re.search(r'<html', s, re.I):
+                      s = re.sub(r'(<html[^>]*>)', lambda m: m.group(1) + "\n" + snippet, s, count=1, flags=re.I)
+                  else:
+                      s = snippet + "\n" + s
+                  open(p, "w", encoding="utf-8").write(s)
+                  print("debug hook injected")
+              else:
+                  print("debug hook already present")
+          PY
+
       - name: Install Capacitor
         run: |
           npm init -y
@@ -69,7 +116,7 @@ jobs:
           KS=".github/rphub-signing.b64"
           if [ -f "$KS" ] && [ -s "$KS" ]; then
             base64 -d "$KS" > /tmp/rphub.jks
-            echo "使用已有 keystore"
+            echo "using existing keystore"
           else
             keytool -genkeypair -v \
               -keystore /tmp/rphub.jks \
@@ -79,7 +126,7 @@ jobs:
               -dname "CN=RPHub, OU=Self, O=Self, L=Unknown, S=Unknown, C=CN"
             mkdir -p .github
             base64 -w0 /tmp/rphub.jks > "$KS"
-            echo "已生成新 keystore"
+            echo "generated new keystore"
           fi
           cat >> android/app/build.gradle << 'EOF'
 
@@ -109,17 +156,26 @@ jobs:
           git add .github/rphub-signing.b64
           if ! git diff --cached --quiet; then
             git commit -m "chore: persist signing keystore [skip ci]"
-            git push || echo "push failed, keystore not persisted"
+            git push || echo "push failed"
           else
             echo "keystore unchanged"
           fi
 
-      - name: Fix AndroidManifest.xml (permissions)
+      - name: Fix AndroidManifest.xml (permissions + edge-to-edge)
         run: |
           python3 - <<'PY'
           import re, os
+          cs = 0
+          vg = "android/variables.gradle"
+          if os.path.exists(vg):
+              t = open(vg).read()
+              m = re.search(r'compileSdkVersion\s*=\s*(\d+)', t) or re.search(r'compileSdk\s*=\s*(\d+)', t)
+              if m:
+                  cs = int(m.group(1))
+          print("compileSdkVersion:", cs)
+
           p = "android/app/src/main/AndroidManifest.xml"
-          s = open(p).read()
+          s = open(p, encoding="utf-8").read()
           for perm in ['android.permission.INTERNET', 'android.permission.ACCESS_NETWORK_STATE']:
               if perm not in s:
                   s = re.sub(r'(<manifest[^>]*>)',
@@ -133,9 +189,13 @@ jobs:
                          r'\1\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />',
                          s, count=1)
           if 'usesCleartextTraffic' not in s:
-              s = s.replace("<application",
-                            '<application android:usesCleartextTraffic="true" android:requestLegacyExternalStorage="true" android:networkSecurityConfig="@xml/network_security_config"', 1)
-          open(p, "w").write(s)
+              attrs = 'android:usesCleartextTraffic="true" android:requestLegacyExternalStorage="true"'
+              if cs >= 35:
+                  attrs += ' android:windowOptOutEdgeToEdgeEnforcement="true"'
+              attrs += ' android:networkSecurityConfig="@xml/network_security_config"'
+              s = s.replace("<application", '<application ' + attrs, 1)
+          open(p, "w", encoding="utf-8").write(s)
+
           os.makedirs("android/app/src/main/res/xml", exist_ok=True)
           open("android/app/src/main/res/xml/network_security_config.xml", "w").write(
               '<?xml version="1.0" encoding="utf-8"?>\n'
@@ -214,6 +274,9 @@ jobs:
                       }
                       webViewRef = wv;
                       wv.getSettings().setJavaScriptEnabled(true);
+                      wv.getSettings().setDomStorageEnabled(true);
+                      wv.getSettings().setAllowFileAccess(true);
+                      wv.getSettings().setAllowContentAccess(true);
                       wv.addJavascriptInterface(new Object() {
                           @JavascriptInterface
                           public void saveBase64(final String data, final String fileName, final String mimeType) {
