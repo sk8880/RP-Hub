@@ -40,51 +40,108 @@ jobs:
           done
           echo "paths patched"
 
-      - name: Inject JS error diagnostics
+      - name: Vendor external CDN resources into app (offline-proof)
         run: |
           python3 - <<'PY'
-          import os, re
-          snippet = """<script>
-          (function(){
-          var shown={};
-          function out(msg){
-          try{
-          if(shown[msg])return;shown[msg]=1;
-          var d=document.createElement('div');
-          d.setAttribute('data-rpdebug','1');
-          d.style.cssText='position:fixed;z-index:2147483647;top:0;left:0;right:0;background:#000000;color:#00ff00;font-size:11px;line-height:14px;padding:6px;word-break:break-all;max-height:60vh;overflow:auto;';
-          d.textContent='RPDEBUG: '+msg;
-          (document.body||document.documentElement).appendChild(d);
-          }catch(e){}
-          try{alert('RPDEBUG: '+msg);}catch(e){}
-          }
-          window.addEventListener('error',function(e){
-          out((e.message||'?')+' | '+(e.filename||'?')+':'+(e.lineno||'?'));
-          },true);
-          window.addEventListener('unhandledrejection',function(e){
-          var r=e.reason;var m=(r&&r.message)?r.message:String(r);
-          out('PROMISE: '+m);
-          });
-          var oe=console.error;
-          console.error=function(){try{out('CONSOLE: '+Array.prototype.slice.call(arguments).join(' '));}catch(e){}oe.apply(console,arguments);};
-          })();
-          </script>"""
-          p = "www/index.html"
-          if not os.path.exists(p):
-              print("index.html not found, skip")
-          else:
-              s = open(p, encoding="utf-8", errors="ignore").read()
-              if "RPDEBUG" not in s:
-                  if re.search(r'<head', s, re.I):
-                      s = re.sub(r'(<head[^>]*>)', lambda m: m.group(1) + "\n" + snippet, s, count=1, flags=re.I)
-                  elif re.search(r'<html', s, re.I):
-                      s = re.sub(r'(<html[^>]*>)', lambda m: m.group(1) + "\n" + snippet, s, count=1, flags=re.I)
-                  else:
-                      s = snippet + "\n" + s
-                  open(p, "w", encoding="utf-8").write(s)
-                  print("debug hook injected")
-              else:
-                  print("debug hook already present")
+          import os, re, glob, hashlib, urllib.request, urllib.parse
+
+          root = "www"
+          vdir = os.path.join(root, "_vendor")
+          os.makedirs(vdir, exist_ok=True)
+          UA = {"User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Mobile Safari/537.36"}
+          total = 0
+
+          def dl(url):
+              try:
+                  req = urllib.request.Request(url, headers=UA)
+                  with urllib.request.urlopen(req, timeout=90) as r:
+                      return r.read()
+              except Exception as e:
+                  print("  !! 下载失败:", url, "->", e)
+                  return None
+
+          def fname(url, kind):
+              h = hashlib.md5(url.encode("utf-8")).hexdigest()[:10]
+              base = os.path.basename(urllib.parse.urlparse(url).path) or ("res." + kind)
+              base = re.sub(r"[^A-Za-z0-9._-]", "_", base)[:50]
+              if "." not in base:
+                  base = base + "." + kind
+              return h + "_" + base
+
+          def fix_css(data, base_url):
+              try:
+                  txt = data.decode("utf-8", "ignore")
+              except Exception:
+                  return data
+              def rep(m):
+                  u = m.group(1).strip()
+                  if not u or u.startswith("data:"):
+                      return m.group(0)
+                  absu = urllib.parse.urljoin(base_url, u)
+                  if not absu.startswith("http"):
+                      return m.group(0)
+                  d = dl(absu)
+                  if d is None:
+                      return m.group(0)
+                  n = fname(absu, "woff2")
+                  open(os.path.join(vdir, n), "wb").write(d)
+                  return "url(%s)" % n
+              return re.sub(r"url\(\s*['\"]?([^'\")]+)['\"]?\s*\)", rep, txt).encode("utf-8")
+
+          for dp, dns, fns in os.walk(root):
+              if os.path.abspath(dp).startswith(os.path.abspath(vdir)):
+                  continue
+              for fn in fns:
+                  if not fn.endswith((".html", ".htm")):
+                      continue
+                  path = os.path.join(dp, fn)
+                  rel = os.path.relpath(vdir, dp).replace(os.sep, "/")
+                  s = open(path, encoding="utf-8", errors="ignore").read()
+                  orig = s
+
+                  def repl_script(m):
+                      global total
+                      url = m.group(2)
+                      d = dl(url)
+                      if d is None:
+                          return m.group(0)
+                      n = fname(url, "js")
+                      open(os.path.join(vdir, n), "wb").write(d)
+                      total += 1
+                      return m.group(1) + rel + "/" + n + m.group(3)
+
+                  s = re.sub(r'(<script[^>]*?\ssrc\s*=\s*")(https?://[^"]+)(")', repl_script, s, flags=re.I)
+
+                  def repl_link(m):
+                      global total
+                      tag, url, q = m.group(1), m.group(2), m.group(3)
+                      low = tag.lower()
+                      if "stylesheet" not in low and "preload" not in low:
+                          return m.group(0)
+                      d = dl(url)
+                      if d is None:
+                          return m.group(0)
+                      if "stylesheet" in low:
+                          d = fix_css(d, url)
+                      n = fname(url, "css")
+                      open(os.path.join(vdir, n), "wb").write(d)
+                      total += 1
+                      return tag + rel + "/" + n + q
+
+                  s = re.sub(r'(<link[^>]*?\shref\s*=\s*")(https?://[^"]+)(")', repl_link, s, flags=re.I)
+
+                  if s != orig:
+                      open(path, "w", encoding="utf-8").write(s)
+                      print("  已本地化外部资源:", path)
+
+          print("共本地化资源数:", total)
+          print("_vendor 内容:", [os.path.basename(p) for p in sorted(glob.glob(os.path.join(vdir, "*")))])
+          idx = os.path.join(root, "index.html")
+          if os.path.exists(idx):
+              t = open(idx, encoding="utf-8", errors="ignore").read()
+              print("index.html 中是否还有外网 script/link:", bool(re.search(r'(?:src|href)="https?://', t)))
+              for m in re.finditer(r'<script[^>]*src="([^"]+)"', t):
+                  print("  script ->", m.group(1))
           PY
 
       - name: Install Capacitor
