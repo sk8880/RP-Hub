@@ -3,7 +3,7 @@ const { useStorageManagement, useTokenUsage } = window.RPHubComposables;
 const { createMessageRenderer } = window.RPHubMessageRenderer;
 const { AppNavigation } = window.RPHubLayoutComponents;
 const { requestChatCompletion, requestJson } = window.RPHubApiClient;
-const { buildApiEndpoint } = window.RPHubApiUtils;
+const { buildApiEndpoint, buildUserInputToolMessages } = window.RPHubApiUtils;
 const {
     ActionConfirmModal,
     ActiveToolEditorModal,
@@ -4365,6 +4365,9 @@ const app = createApp({
             const continueAssistantMessageId = options.continueAssistantMessageId || null;
             const continuationToolCallId = options.continuationToolCallId || null;
             const requestModel = settings.model;
+            const obfuscateInput = /gemini/i.test(String(requestModel || ''));
+            const latestUserMessage = [...chatHistory.value].reverse().find(message => message?.role === 'user');
+            const latestUserIndex = chatHistory.value.indexOf(latestUserMessage);
             const requestTools = activeToolDepth < ACTIVE_TOOL_MAX_AUTO_CONTINUE ? getEnabledActiveTools() : [];
 
             if (!currentCharacter.value) {
@@ -4828,16 +4831,26 @@ const app = createApp({
                 }
                 if (requestSignal.aborted) throw createAbortReason();
 
+                // 最后再搬移整条用户消息，连同世界书、召回和本轮附加要求一起交给工具。
+                const inputIndex = obfuscateInput ? messages.findIndex(message => message.role === 'user'
+                    && message._sourceIndexes?.includes(latestUserIndex)) : -1;
+                if (inputIndex >= 0) {
+                    const inputMessage = messages[inputIndex];
+                    const [inputCall, inputResult] = buildUserInputToolMessages(inputMessage.content, `call_${generateUUID()}`);
+                    inputMessage.content = '读取 read_user_input 的返回内容，作为本轮用户输入继续回复。'
+                        + (isTruncationEnabled.value ? `(${BUILTIN_PROMPTS.replyToolInstruction.replace(/。$/, '')})` : '');
+                    for (const key of ['_worldInfoEntries', '_enhancedMemoryRecallCount']) {
+                        inputResult[key] = inputMessage[key];
+                        delete inputMessage[key];
+                    }
+                    messages.splice(inputIndex + 1, 0, inputCall, inputResult);
+                }
+
                 // 必须在正则、角色合并和记忆处理之后追加，保留 tool_call_id 及服务端签名。
                 messages.push(...activeToolMessages);
                 // 上下文查看器的数据只给弹窗用，长对话里整理一次要上百毫秒，等请求发出后再做。
                 const contextViewerInput = { messages, budgetedEntries, triggeredEntries, postprocessedChatHistory, worldInfoSettings };
-                setTimeout(() => {
-                    const contextViewerState = buildContextViewerState(contextViewerInput);
-                    lastContextMessages.value = contextViewerState.contextMessages;
-                    lastTriggeredWorldInfos.value = contextViewerState.triggeredWorldInfos;
-                }, 0);
-
+                const inputPrompt = inputIndex >= 0 ? messages[inputIndex].content : '';
                 const apiMessages = messages.map(({ role, name, content, tool_calls, tool_call_id, reasoning_content, reasoning, reasoning_details, extra_content }) => ({
                     role,
                     name,
@@ -4849,9 +4862,26 @@ const app = createApp({
                     ...(reasoning_details ? { reasoning_details } : {}),
                     ...(extra_content ? { extra_content } : {})
                 }));
+                const prepareRequest = () => {
+                    if (inputIndex >= 0) {
+                        // UUID 转成零宽字符，每次实际请求（含自动重试）生成新的前缀。
+                        const alphabet = '\u200B\u200C\u200D\u2060';
+                        const prefix = [...generateUUID().replace(/-/g, '')].map(char => {
+                            const value = parseInt(char, 16);
+                            return alphabet[value >> 2] + alphabet[value & 3];
+                        }).join('');
+                        messages[inputIndex].content = apiMessages[inputIndex].content = prefix + inputPrompt;
+                    }
+                    setTimeout(() => {
+                        const contextViewerState = buildContextViewerState(contextViewerInput);
+                        lastContextMessages.value = contextViewerState.contextMessages;
+                        lastTriggeredWorldInfos.value = contextViewerState.triggeredWorldInfos;
+                    }, 0);
+                };
                 const responseResult = await requestTrackedChatCompletion({
                     model: requestModel,
                     messages: apiMessages,
+                    onBeforeRequest: prepareRequest,
                     logResponse: true,
                     replyInTool: isTruncationEnabled.value,
                     tools: buildActiveToolDefinitions(requestTools),
@@ -8277,7 +8307,7 @@ const app = createApp({
             frameStyle: () => {
                 const tone = getComputedStyle(document.documentElement).getPropertyValue('--primary-500').trim() || '99 102 241';
                 return `.memory-cite-text{text-decoration:underline dotted rgb(${tone} / .75);text-decoration-thickness:1.5px;text-underline-offset:.3em;cursor:pointer}`
-                    + `.memory-cite{display:inline-flex;align-items:center;justify-content:center;min-width:1.4em;height:1.4em;margin:0 .15em;padding:0 .35em;border:0;border-radius:999px;background:rgb(${tone} / .14);color:rgb(${tone});font:700 .8em/1 system-ui,sans-serif;vertical-align:.4em;cursor:pointer}`;
+                    + `.memory-cite{display:inline-flex;align-items:center;justify-content:center;min-width:1.4em;height:1.4em;margin:0 .15em;padding:0 .35em;border:0;border-radius:999px;background:rgb(${tone} / .14);color:rgb(${tone});font:700 .75em/1 system-ui,sans-serif;vertical-align:.4em;cursor:pointer}`;
             }
         };
 
