@@ -59,6 +59,17 @@
         };
 
         const sanitizeMarkdown = (text) => DOMPurify.sanitize(marked.parse(text), cleanConfig);
+        const legacySectionLabels = {
+            konatan_planning: '原记录分析', aftertalk: '作者附言', tucao: '作者吐槽',
+            tableedit: '表格更新记录', izumiedit: '剧情摘要', danmu: '弹幕',
+            branches: '后续选项', parallel_world: '平行剧情'
+        };
+        const formatLegacySections = text => text.replace(
+            /```[\s\S]*?```|`[^`\n]*`|<(konatan_planning~?|aftertalk|tucao|tableEdit|IzumiEdit|danmu|branches|parallel_world)(?:\s[^>]*)?>([\s\S]*?)<\/\1\s*>/gi,
+            (match, tag, body) => tag
+                ? `\n\n<details class="legacy-message-section"><summary>${legacySectionLabels[tag.toLowerCase().replace(/~$/, '')]}</summary>\n\n${body.trim()}\n\n</details>\n\n`
+                : match
+        );
         const markdownOnlyRenderer = new marked.Renderer();
         markdownOnlyRenderer.html = token => String(typeof token === 'string' ? token : token.text)
             .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -167,31 +178,34 @@
             documentNode.querySelectorAll('.memory-cite').forEach(underlineCitedSentence);
             return textNodes.length > 0;
         };
-        // 以 HTML 开头的回复不经过 Markdown，正文文字直接挂在最外层；消息容器会把最外层的每个子元素排成单独一块，
-        // 所以把带引用的那段行内内容包进段落，角标才会跟在句末。
+        // 自定义标签被清理后可能留下裸文本，补回段落以保留换行、内边距和行内引用。
         const BLOCK_TAG_PATTERN = /^(ADDRESS|ARTICLE|ASIDE|BLOCKQUOTE|DETAILS|DIV|DL|FIELDSET|FIGURE|FOOTER|FORM|H[1-6]|HEADER|HR|IFRAME|LI|MAIN|NAV|OL|P|PRE|SCRIPT|SECTION|STYLE|TABLE|UL)$/;
-        const wrapLooseCitationText = (documentNode) => {
+        const wrapLooseText = (documentNode) => {
             const body = documentNode.body;
+            let modified = false;
             const isInline = node => node && (node.nodeType === 3 || (node.nodeType === 1 && !BLOCK_TAG_PATTERN.test(node.tagName)));
             [...body.childNodes].forEach(node => {
-                if (node.parentNode !== body || node.nodeType !== 3 || !MEMORY_CITATION_PATTERN.test(node.nodeValue)) return;
+                if (node.parentNode !== body || node.nodeType !== 3 || !node.nodeValue.trim()) return;
                 let start = node;
                 let end = node;
                 while (isInline(start.previousSibling)) start = start.previousSibling;
                 while (isInline(end.nextSibling)) end = end.nextSibling;
                 const paragraph = documentNode.createElement('p');
+                paragraph.className = 'message-plain-paragraph';
                 start.before(paragraph);
                 for (let current = start, next; current; current = next) {
                     next = current === end ? null : current.nextSibling;
                     paragraph.append(current);
                 }
+                modified = true;
             });
+            return modified;
         };
         // 正则替换成 HTML、或本身以 HTML 开头的回复走单独的渲染分支，也要补上记忆引用。
         const decorateHtml = (html, role) => {
             if (role !== 'assistant' || !/\[M\d/.test(html)) return html;
             const documentNode = new DOMParser().parseFromString(html, 'text/html');
-            wrapLooseCitationText(documentNode);
+            wrapLooseText(documentNode);
             return decorateMemoryCitations(documentNode) ? documentNode.body.innerHTML : html;
         };
         // 美化正则可能会改写方括号（例如把 [状态] 变成标签），先把引用换成正则碰不到的占位符，替换完再还原。
@@ -212,6 +226,7 @@
                 const html = DOMPurify.sanitize(marked.parse(processed, { renderer: markdownOnlyRenderer }));
                 return cacheValue(renderedCache, cacheKey, decorateHtml(html, role));
             }
+            if (role === 'assistant') processed = formatLegacySections(processed);
             const trimmed = processed.trim();
             const htmlMatch = trimmed.match(/(<!doctype html>|<html\b[^>]*>)/i);
 
@@ -258,8 +273,9 @@
                 const codeBlocksChanged = replaceHtmlCodeBlocks(documentNode);
                 const paragraphsChanged = replaceEscapedHtmlParagraphs(documentNode);
                 const panelsChanged = replaceScriptedPanels(documentNode);
+                const looseTextChanged = wrapLooseText(documentNode);
                 const citationsChanged = role === 'assistant' && decorateMemoryCitations(documentNode);
-                const modified = codeBlocksChanged || paragraphsChanged || panelsChanged || citationsChanged;
+                const modified = codeBlocksChanged || paragraphsChanged || panelsChanged || looseTextChanged || citationsChanged;
                 if (modified) return cacheValue(renderedCache, cacheKey, documentNode.body.innerHTML);
             } catch (error) {
                 console.error('Error rendering HTML preview:', error);
@@ -469,231 +485,5 @@
         };
     };
 
-    const useStorageManagement = ({
-        characters,
-        confirm,
-        deleteStorageKeys,
-        ensureStorage,
-        getBranchOwnerId,
-        getLegacyDb,
-        getMainDb,
-        getStorageLogicalKey,
-        globalUiTemplates,
-        readStorageKeys,
-        saveStoredValue,
-        scanStorageEntries,
-        scopedStorageNames,
-        toast
-    }) => {
-        const categories = Object.freeze([
-            { key: 'characters', label: '角色卡', color: '#4659e2' },
-            { key: 'chat', label: '聊天记录', color: '#7b8ff8' },
-            { key: 'classic', label: '记忆系统', color: '#4fb3a4' },
-            { key: 'other', label: '其他', color: '#9d9dab' }
-        ]);
-        const storageStats = reactive({
-            loading: false,
-            cleaning: false,
-            hasMeasured: false,
-            error: '',
-            usage: 0,
-            quota: 0,
-            orphanedBytes: 0,
-            orphanedItems: 0,
-            categories: []
-        });
-        let unusedSnapshot = { mainKeys: [], legacyKeys: [], templateRuntimeKeys: [] };
-
-        const formatStorageSize = (bytes) => {
-            const size = Math.max(0, Number(bytes) || 0);
-            if (size < 1024) return `${Math.round(size)} B`;
-            const units = ['KB', 'MB', 'GB'];
-            let value = size / 1024;
-            let unit = units[0];
-            for (let index = 1; index < units.length && value >= 1024; index++) {
-                value /= 1024;
-                unit = units[index];
-            }
-            return `${value >= 10 ? value.toFixed(1) : value.toFixed(2)} ${unit}`;
-        };
-        const getScopedStorageInfo = (logicalKey) => {
-            for (const name of scopedStorageNames) {
-                const prefix = `${name}_`;
-                if (logicalKey.startsWith(prefix)) return { name, id: logicalKey.slice(prefix.length) };
-            }
-            return null;
-        };
-        const getStorageCategory = (logicalKey) => {
-            if (logicalKey === 'characters') return 'characters';
-            if (logicalKey.startsWith('chat_')) return 'chat';
-            if (logicalKey.startsWith('classic_memories_')) return 'classic';
-            return 'other';
-        };
-        const estimateStorageValueSize = (value, seen = new WeakSet()) => {
-            if (value == null) return 0;
-            if (typeof value === 'string') return value.length * 2;
-            if (typeof value === 'number' || typeof value === 'bigint') return 8;
-            if (typeof value === 'boolean') return 4;
-            if (typeof value !== 'object') return 0;
-            if (value instanceof Blob) return value.size;
-            if (value instanceof ArrayBuffer) return value.byteLength;
-            if (ArrayBuffer.isView(value)) return value.byteLength;
-            if (seen.has(value)) return 0;
-            seen.add(value);
-
-            let bytes = 0;
-            if (Array.isArray(value)) {
-                if (value.length && typeof value[0] === 'number') return value.length * 8;
-                value.forEach(item => { bytes += estimateStorageValueSize(item, seen); });
-            } else {
-                Object.keys(value).forEach(key => {
-                    bytes += key.length * 2 + estimateStorageValueSize(value[key], seen);
-                });
-            }
-            return bytes;
-        };
-        const estimateStorageEntrySize = (key, value) => String(key).length * 2 + estimateStorageValueSize(value);
-
-        const refreshStorageStats = async () => {
-            if (storageStats.loading) return;
-            storageStats.loading = true;
-            storageStats.error = '';
-            try {
-                await ensureStorage();
-                const [mainKeys, legacyKeys, estimate] = await Promise.all([
-                    readStorageKeys(getMainDb()),
-                    readStorageKeys(getLegacyDb()),
-                    navigator.storage?.estimate?.().catch(() => ({})) || Promise.resolve({})
-                ]);
-                const mainLogicalKeys = new Set(mainKeys.map(getStorageLogicalKey));
-                const scopedLogicalKeys = new Set([...mainKeys, ...legacyKeys]
-                    .map(getStorageLogicalKey)
-                    .filter(logicalKey => getScopedStorageInfo(logicalKey)));
-                const liveCharacterIds = new Set(characters.value.map(character => character?.uuid).filter(Boolean));
-                const isOrphanedEntry = (source, logicalKey) => {
-                    // 旧正文分片已停用，仅在用户确认清理时删除。
-                    if (logicalKey.startsWith('memories_')) return true;
-                    if (source === 'legacy' && mainLogicalKeys.has(logicalKey)) return true;
-                    const scoped = getScopedStorageInfo(logicalKey);
-                    if (!scoped || liveCharacterIds.has(getBranchOwnerId(scoped.id))) return false;
-                    if (scoped.name !== 'chat' || !/^\d+$/.test(scoped.id)) return true;
-                    const character = characters.value[Number(scoped.id)];
-                    return !character || (character.uuid && scopedLogicalKeys.has(`chat_${character.uuid}`));
-                };
-
-                const categoryBytes = new Map(categories.map(category => [category.key, 0]));
-                const orphanedKeys = { main: [], legacy: [] };
-                let orphanedEntryBytes = 0;
-                const inspectEntry = (source, key, value) => {
-                    const logicalKey = getStorageLogicalKey(key);
-                    const bytes = estimateStorageEntrySize(key, value);
-                    const category = getStorageCategory(logicalKey);
-                    categoryBytes.set(category, categoryBytes.get(category) + bytes);
-                    if (isOrphanedEntry(source, logicalKey)) {
-                        orphanedKeys[source].push(key);
-                        orphanedEntryBytes += bytes;
-                    }
-                };
-                await scanStorageEntries(getMainDb(), 'main', inspectEntry);
-                await scanStorageEntries(getLegacyDb(), 'legacy', inspectEntry);
-
-                const templateRuntimeKeys = [];
-                globalUiTemplates.value.forEach((template, templateIndex) => {
-                    Object.keys(template.runtimeByCharacter || {}).forEach(characterId => {
-                        if (!liveCharacterIds.has(getBranchOwnerId(characterId))) {
-                            templateRuntimeKeys.push({ templateIndex, characterId });
-                        }
-                    });
-                });
-                const embeddedOrphanBytes = templateRuntimeKeys.reduce((total, item) => (
-                    total + estimateStorageEntrySize(
-                        item.characterId,
-                        globalUiTemplates.value[item.templateIndex]?.runtimeByCharacter?.[item.characterId]
-                    )
-                ), 0);
-
-                try {
-                    for (let index = 0; index < localStorage.length; index++) {
-                        const key = localStorage.key(index);
-                        const bytes = estimateStorageEntrySize(key || '', localStorage.getItem(key) || '');
-                        const category = getStorageCategory(key || '');
-                        categoryBytes.set(category, categoryBytes.get(category) + bytes);
-                    }
-                } catch (_) { }
-
-                const accountedBytes = [...categoryBytes.values()].reduce((total, bytes) => total + bytes, 0);
-                const measuredUsage = Number(estimate.usage) || accountedBytes;
-                const sizeScale = accountedBytes > 0 ? measuredUsage / accountedBytes : 1;
-                storageStats.usage = measuredUsage;
-                storageStats.quota = Number(estimate.quota) || 0;
-                storageStats.orphanedBytes = (orphanedEntryBytes + embeddedOrphanBytes) * sizeScale;
-                storageStats.orphanedItems = orphanedKeys.main.length + orphanedKeys.legacy.length
-                    + templateRuntimeKeys.length;
-                storageStats.categories = categories
-                    .map(category => ({ ...category, bytes: (categoryBytes.get(category.key) || 0) * sizeScale }))
-                    .filter(category => category.bytes > 0);
-                unusedSnapshot = {
-                    mainKeys: orphanedKeys.main,
-                    legacyKeys: orphanedKeys.legacy,
-                    templateRuntimeKeys
-                };
-                storageStats.hasMeasured = true;
-            } catch (error) {
-                console.error('Failed to inspect storage:', error);
-                storageStats.error = '读取存储信息失败，请稍后重试';
-                storageStats.orphanedBytes = 0;
-                storageStats.orphanedItems = 0;
-                storageStats.categories = [];
-                unusedSnapshot = { mainKeys: [], legacyKeys: [], templateRuntimeKeys: [] };
-            } finally {
-                storageStats.loading = false;
-            }
-        };
-
-        const cleanupUnusedStorage = async () => {
-            await refreshStorageStats();
-            if (storageStats.error) return;
-            if (storageStats.orphanedItems === 0) {
-                toast('没有发现无用残留', 'info');
-                return;
-            }
-            const snapshot = {
-                mainKeys: [...unusedSnapshot.mainKeys],
-                legacyKeys: [...unusedSnapshot.legacyKeys],
-                templateRuntimeKeys: unusedSnapshot.templateRuntimeKeys.map(item => ({ ...item }))
-            };
-            const orphanedBytes = storageStats.orphanedBytes;
-            const orphanedItems = storageStats.orphanedItems;
-            confirm(
-                `将清理 ${orphanedItems} 项无用残留（约 ${formatStorageSize(orphanedBytes)}）。现有角色的数据不会受到影响。`,
-                async () => {
-                    storageStats.cleaning = true;
-                    try {
-                        await Promise.all([
-                            deleteStorageKeys(getMainDb(), snapshot.mainKeys),
-                            deleteStorageKeys(getLegacyDb(), snapshot.legacyKeys)
-                        ]);
-                        snapshot.templateRuntimeKeys.forEach(({ templateIndex, characterId }) => {
-                            const runtime = globalUiTemplates.value[templateIndex]?.runtimeByCharacter;
-                            if (runtime) delete runtime[characterId];
-                        });
-                        await Promise.all([
-                            saveStoredValue('global_ui_templates', globalUiTemplates.value)
-                        ]);
-                        await refreshStorageStats();
-                        toast(`已清理 ${orphanedItems} 项无用残留，约 ${formatStorageSize(orphanedBytes)}`, 'success');
-                    } catch (error) {
-                        console.error('Failed to clean unused storage:', error);
-                        toast('清理失败，请稍后重试', 'error');
-                    } finally {
-                        storageStats.cleaning = false;
-                    }
-                }
-            );
-        };
-
-        return { cleanupUnusedStorage, formatStorageSize, refreshStorageStats, storageStats };
-    };
-
-    window.RPHubComposables = Object.freeze({ useStorageManagement, useTokenUsage });
+    window.RPHubComposables = Object.freeze({ useTokenUsage });
 })();
