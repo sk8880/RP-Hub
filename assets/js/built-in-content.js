@@ -76,7 +76,7 @@ year 2025, textless version, {{petite,loli}}, Petite figure, no text, The image 
             uiTemplateEnabled ? '[变量更新分析]' : '',
             '[最终检查]'
         ].filter(Boolean).join('/');
-        const languageInstruction = String(tag).toLowerCase() === 'thinking' ? '使用中文' : '';
+        const languageInstruction = tag === 'thinking' ? '使用中文' : '';
         return `在<${tag}>标签中${languageInstruction}输出包含${labels}的完整的本轮分析，${suffix}`;
     };
 
@@ -129,20 +129,20 @@ year 2025, textless version, {{petite,loli}}, Petite figure, no text, The image 
         '</active_tools>'
     ].join('\n');
 
-    const buildUiTemplateJsonExample = (templatePayload = [], multipleTemplates = false) => {
+    const buildUiTemplateJsonExample = (templatePayload, multipleTemplates) => {
         const sampleVariables = (template) => {
-            const value = template?.currentVariables;
+            const value = template.currentVariables;
             if (Array.isArray(value)) return value.slice(0, 2);
             if (!value || typeof value !== 'object') return {};
             return Object.fromEntries(Object.entries(value).slice(0, 2));
         };
         if (multipleTemplates) {
-            return JSON.stringify((Array.isArray(templatePayload) ? templatePayload : []).slice(0, 2).map(template => ({
-                id: String(template?.id || '模板ID'),
+            return JSON.stringify(templatePayload.slice(0, 2).map(template => ({
+                id: String(template.id || '模板ID'),
                 variables: sampleVariables(template)
             })), null, 2);
         }
-        return JSON.stringify(sampleVariables(templatePayload?.[0]), null, 2);
+        return JSON.stringify(sampleVariables(templatePayload[0]), null, 2);
     };
 
     const buildUiTemplateUpdateRules = ({ userName, multipleTemplates = false, outputOnlyBlock = false, includeHtmlRule = false } = {}) => [
@@ -162,9 +162,9 @@ year 2025, textless version, {{petite,loli}}, Petite figure, no text, The image 
     ].filter(Boolean);
 
     const buildMainModelUiTemplatePrompt = ({ templatePayload, userName }) => {
-        const isSingleTemplate = Array.isArray(templatePayload) && templatePayload.length === 1;
-        const templateIds = [...new Set((Array.isArray(templatePayload) ? templatePayload : [])
-            .map(template => String(template?.id || '').trim())
+        const isSingleTemplate = templatePayload.length === 1;
+        const templateIds = [...new Set(templatePayload
+            .map(template => String(template.id || '').trim())
             .filter(Boolean))];
         return [
             '[UI模板变量更新]',
@@ -320,7 +320,6 @@ image###英文Tag###
             resultCount: Object.freeze({ min: 5, default: 5, max: 10, version: 4 }),
             maxAutoContinue: 4,
             aggressiveness: Object.freeze({
-                force: 'force',
                 adaptive: 'adaptive',
                 options: Object.freeze([
                     { value: 'force', label: '强制' },
@@ -713,7 +712,7 @@ ${memoryCitationCotLine}
                     ? '[最终检查]\n这次回复应当是对困难的实际判断，不是把规则再抄一遍；不生成虚构正文，保留后续续写需要的上下文。'
                     : '[最终检查]\n确认后续正文有明确承接点，没有替用户行动，也没有把准备说明混进剧情；按<writing_style>完成检查后直接续写。'
             ].filter(Boolean);
-            const baseContent = String(prefillBaseContent || '')
+            const baseContent = prefillBaseContent
                 .replace(/<(thinking|think|cot)>[\s\S]*?<\/\s*\1\s*>\s*/gi, '')
                 .trimStart();
             if (!prefillEnabled) return baseContent;
@@ -760,13 +759,16 @@ ${closingInstruction}
 
 // --- Update announcement (keep this section at the bottom) ---
 window.RPHubLatestUpdate = Object.freeze({
-    id: 10223,
+    id: 10226,
     title: '网站公告',
     content: `
-### RP-Hub 2.0.4
+### RP-Hub 2.0.6
 
-- 支持一键云端备份与跨设备下载/恢复
+- 图片改由聊天主模型直接识别，无需单独配置识图模型
+- 模型设置集中展示聊天主模型、记忆总结模型、记忆向量模型和变量分析模型
+- 优化密钥输入框，未聚焦时不再为复制和查看按钮留白
+- 默认 API 地址更新，同步更新获取 API 的入口
 
-#### 更新时间：10/18/16:23
+#### 更新时间：2026/11/06
     `
 });
